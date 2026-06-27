@@ -1,56 +1,53 @@
-"""
-PinAgent Cloud — Flask server for Render.com
-Pipeline: AliExpress API → Image Processing → Claude AI → Pinterest + Telegram
-"""
-import os, json, time, hmac, hashlib, urllib.parse, urllib.request, ssl, threading, schedule
-from flask import Flask, request, jsonify, send_from_directory
-from datetime import datetime
+import os, json, hashlib, urllib.parse, urllib.request, ssl, threading, time
+from flask import Flask, jsonify, send_from_directory, request
+from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__, static_folder="static")
 ctx = ssl.create_default_context()
 
-# ── Config from environment variables ────────────────────────────────────────
-ANTHROPIC_KEY  = os.environ.get("ANTHROPIC_KEY", "")
-ALI_KEY        = os.environ.get("ALI_KEY", "")
-ALI_SECRET     = os.environ.get("ALI_SECRET", "")
-ALI_TRACKING   = os.environ.get("ALI_TRACKING", "529958")
-PIN_TOKEN      = os.environ.get("PIN_TOKEN", "")
-PIN_BOARD_ID   = os.environ.get("PIN_BOARD_ID", "")
-TG_TOKEN       = os.environ.get("TG_TOKEN", "")
-TG_CHANNEL     = os.environ.get("TG_CHANNEL", "@Ofertassdiariasaliexpresss")
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")
+ALI_KEY       = os.environ.get("ALI_KEY", "")
+ALI_SECRET    = os.environ.get("ALI_SECRET", "")
+ALI_TRACKING  = os.environ.get("ALI_TRACKING", "529958")
+PIN_TOKEN     = os.environ.get("PIN_TOKEN", "")
+PIN_BOARD_ID  = os.environ.get("PIN_BOARD_ID", "")
+TG_TOKEN      = os.environ.get("TG_TOKEN", "")
+TG_CHANNEL    = os.environ.get("TG_CHANNEL", "@Ofertassdiariasaliexpresss")
 
-# ── Peak schedule BRT ─────────────────────────────────────────────────────────
-PEAK_SCHEDULE = {
-    0: ["09:00","12:00","20:00","21:00"],  # Dom
-    1: ["12:00","15:00","20:00","21:00"],  # Seg
-    2: ["09:00","13:00","20:00","21:00"],  # Ter
-    3: ["10:00","14:00","19:00","21:00"],  # Qua
-    4: ["10:00","12:00","19:00","20:00"],  # Qui
-    5: ["20:00","21:00"],                  # Sex
-    6: ["09:00","10:00","20:00","21:00"],  # Sáb
+PEAK = {
+    0: ["09:00","12:00","20:00","21:00"],
+    1: ["12:00","15:00","20:00","21:00"],
+    2: ["09:00","13:00","20:00","21:00"],
+    3: ["10:00","14:00","19:00","21:00"],
+    4: ["10:00","12:00","19:00","20:00"],
+    5: ["20:00","21:00"],
+    6: ["09:00","10:00","20:00","21:00"],
 }
 KEYWORDS = [
-    "fone bluetooth sem fio",    # Dom
-    "smartwatch barato 2024",    # Seg
-    "cabo usb tipo c carga rapida", # Ter
-    "case celular transparente", # Qua
-    "led strip rgb quarto",      # Qui
-    "organizador cozinha gaveta",# Sex
-    "brinquedo educativo crianca", # Sáb
+    "fone bluetooth sem fio",
+    "smartwatch barato 2024",
+    "cabo usb tipo c carga rapida",
+    "case celular transparente",
+    "led strip rgb quarto",
+    "organizador cozinha gaveta",
+    "brinquedo educativo crianca",
 ]
+DAYS = ["Dom","Seg","Ter","Qua","Qui","Sex","Sab"]
 
 logs = []
 stats = {"today": 0, "total": 0, "last_run": None}
 
-# ── MD5 for AliExpress ────────────────────────────────────────────────────────
-def md5(s):
-    return hashlib.md5(s.encode()).hexdigest().upper()
+def get_brt():
+    return datetime.now(timezone(timedelta(hours=-3)))
 
-def ali_sign(params, secret):
-    s = "".join(f"{k}{params[k]}" for k in sorted(params))
-    return md5(f"{secret}{s}{secret}")
+def add_log(msg, level="info"):
+    ts = get_brt().strftime("%H:%M:%S")
+    entry = {"ts": ts, "msg": msg, "level": level}
+    logs.append(entry)
+    if len(logs) > 100:
+        logs.pop(0)
+    print(f"[{ts}] {msg}", flush=True)
 
-# ── HTTP helpers ──────────────────────────────────────────────────────────────
 def http_post(url, body, headers=None):
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method="POST")
@@ -61,318 +58,217 @@ def http_post(url, body, headers=None):
     with urllib.request.urlopen(req, context=ctx, timeout=60) as r:
         return json.loads(r.read())
 
-def http_get(url, headers=None):
-    req = urllib.request.Request(url)
-    if headers:
-        for k, v in headers.items():
-            req.add_header(k, v)
-    with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
-        return r.read()
+def ali_sign(params, secret):
+    s = "".join(f"{k}{params[k]}" for k in sorted(params))
+    return hashlib.md5(f"{secret}{s}{secret}".encode()).hexdigest().upper()
 
-def add_log(msg, level="info"):
-    brt = get_brt()
-    ts = brt.strftime("%H:%M:%S")
-    logs.append({"ts": ts, "msg": msg, "level": level})
-    if len(logs) > 100:
-        logs.pop(0)
-    print(f"[{ts}] {msg}")
+def mock_products(kw, n=2):
+    return [
+        {"product_id":"1005001","product_title":f"Fone Bluetooth 5.3 TWS {kw}",
+         "sale_price":"29.90","original_price":"79.90","evaluate_rate":"96%",
+         "product_main_image_url":"https://ae01.alicdn.com/kf/HTB1.jpg"},
+        {"product_id":"1005002","product_title":f"Smartwatch {kw} Pro Max",
+         "sale_price":"45.50","original_price":"120.00","evaluate_rate":"94%",
+         "product_main_image_url":"https://ae01.alicdn.com/kf/HTB2.jpg"},
+    ][:n]
 
-def get_brt():
-    from datetime import timezone, timedelta
-    return datetime.now(timezone(timedelta(hours=-3)))
-
-# ── Step 1: Fetch AliExpress products ────────────────────────────────────────
-def fetch_products(keyword, count=2):
+def fetch_products(keyword, n=2):
     if not ALI_KEY or not ALI_SECRET:
-        add_log("Sem credenciais AliExpress — usando demo", "warn")
-        return mock_products(keyword, count)
+        add_log("Demo mode — sem credenciais AliExpress", "warn")
+        return mock_products(keyword, n)
     try:
         ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         params = {
-            "app_key": ALI_KEY,
-            "timestamp": ts,
-            "sign_method": "md5",
+            "app_key": ALI_KEY, "timestamp": ts, "sign_method": "md5",
             "method": "aliexpress.affiliate.product.query",
-            "keywords": keyword,
-            "target_currency": "BRL",
-            "target_language": "PT",
-            "tracking_id": ALI_TRACKING,
-            "page_no": "1",
-            "page_size": str(count),
-            "country": "BR",
-            "sort": "SALE_PRICE_ASC",
-            "min_sale_price": "1000",   # min R$10 em centavos
-            "max_sale_price": "20000",  # max R$200
+            "keywords": keyword, "target_currency": "BRL",
+            "target_language": "PT", "tracking_id": ALI_TRACKING,
+            "page_no": "1", "page_size": str(n), "country": "BR",
         }
         params["sign"] = ali_sign(params, ALI_SECRET)
         url = "https://api-sg.aliexpress.com/sync?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, context=ctx, timeout=30) as r:
+        with urllib.request.urlopen(url, context=ctx, timeout=30) as r:
             data = json.loads(r.read())
-        items = (data.get("aliexpress_affiliate_product_query_response", {})
-                     .get("resp_result", {})
-                     .get("result", {})
-                     .get("products", {})
-                     .get("product", []))
+        items = (data.get("aliexpress_affiliate_product_query_response",{})
+                     .get("resp_result",{}).get("result",{})
+                     .get("products",{}).get("product",[]))
         if items:
-            add_log(f"✅ {len(items)} produto(s) AliExpress", "ok")
-            return items[:count]
+            add_log(f"AliExpress: {len(items)} produto(s)", "ok")
+            return items[:n]
     except Exception as e:
-        add_log(f"AliExpress erro: {e} — usando demo", "warn")
-    return mock_products(keyword, count)
+        add_log(f"AliExpress erro: {e}", "warn")
+    return mock_products(keyword, n)
 
-def mock_products(kw, n):
-    base = [
-        {"product_id":"1005001","product_title":f"Fone Bluetooth 5.3 TWS {kw}","sale_price":"29.90","original_price":"79.90","evaluate_rate":"96%","commission_rate":"5.2%","product_main_image_url":"https://ae01.alicdn.com/kf/HTB1X.jpg","product_detail_url":f"https://www.aliexpress.com/item/1005001.html"},
-        {"product_id":"1005002","product_title":f"Smartwatch {kw} Pro","sale_price":"45.50","original_price":"120.00","evaluate_rate":"94%","commission_rate":"4.8%","product_main_image_url":"https://ae01.alicdn.com/kf/HTB2X.jpg","product_detail_url":f"https://www.aliexpress.com/item/1005002.html"},
-    ]
-    return base[:n]
-
-# ── Step 2: Get product image (with fallback) ─────────────────────────────────
-def get_product_image_url(product):
-    """
-    Returns best image URL for Pinterest.
-    Pinterest needs publicly accessible images.
-    AliExpress CDN images work directly.
-    """
-    img = product.get("product_main_image_url", "")
-    # Ensure HTTPS
-    if img.startswith("http://"):
-        img = "https://" + img[7:]
-    # Fallback if empty
-    if not img:
-        img = "https://ae01.alicdn.com/kf/HTB1default.jpg"
-    return img
-
-# ── Step 3: Generate SEO content with Claude ──────────────────────────────────
 def generate_content(product, keyword):
-    aff_url_pin = f"https://www.aliexpress.com/item/{product['product_id']}.html?aff_fcid={ALI_TRACKING}&sk=pinterest&aff_platform=portals-tool"
-    aff_url_tg  = f"https://www.aliexpress.com/item/{product['product_id']}.html?aff_fcid={ALI_TRACKING}&sk=telegram&aff_platform=portals-tool"
-
-    orig  = float(product.get("original_price", 0) or 0)
+    pid   = product.get("product_id","")
+    title = product.get("product_title","")
     sale  = float(product.get("sale_price", 0) or 0)
+    orig  = float(product.get("original_price", 0) or 0)
     disc  = round((1 - sale/orig)*100) if orig > 0 else 0
-    rate  = product.get("evaluate_rate", "95%")
-    comm  = product.get("commission_rate", "4%")
-    title = product.get("product_title", "")
-    img   = get_product_image_url(product)
+    rate  = product.get("evaluate_rate","95%")
+    img   = product.get("product_main_image_url","")
+    aff_pin = f"https://www.aliexpress.com/item/{pid}.html?aff_fcid={ALI_TRACKING}&sk=pinterest"
+    aff_tg  = f"https://www.aliexpress.com/item/{pid}.html?aff_fcid={ALI_TRACKING}&sk=telegram"
 
-    prompt = f"""Você é especialista em marketing de afiliados para o mercado brasileiro.
-Nicho: achadinhos AliExpress. Canal: @Ofertassdiariasaliexpresss e Pinterest achadinhos_virais_br.
+    if not ANTHROPIC_KEY:
+        return {
+            "pinterest_title": f"{title[:80]} — R$ {sale} (-{disc}%)",
+            "pinterest_description": f"Achado incrível! {title} por R$ {sale}\n#achadinhos #aliexpress #oferta #desconto #brasil",
+            "pinterest_alt_text": f"Produto AliExpress: {title}. Preço R$ {sale}",
+            "telegram_text": f"🔥 <b>{title}</b>\n\n💰 R$ {sale} (-{disc}%)\n⭐ {rate}\n\n<a href='{aff_tg}'>Comprar</a>",
+            "aff_url_pin": aff_pin, "aff_url_tg": aff_tg, "image_url": img, "product": product,
+        }
 
-PRODUTO:
-- Nome: {title}
-- Preço: R$ {sale} (era R$ {orig}, -{disc}%)
-- Avaliação: {rate} dos compradores
-- Comissão afiliado: {comm}
-- Keyword do dia: {keyword}
-- Link Pinterest: {aff_url_pin}
-- Link Telegram: {aff_url_tg}
+    prompt = f"""Copywriter afiliados Brasil — AliExpress achadinhos.
+Produto: {title}
+Preco: R$ {sale} (era R$ {orig}, -{disc}%)
+Avaliacao: {rate} | Keyword: {keyword}
+Link Pinterest: {aff_pin} | Link Telegram: {aff_tg}
 
-GERE conteúdo otimizado para máximo tráfego orgânico. Responda SOMENTE em JSON válido:
-{{
-  "pinterest_title": "título Pin SEO max 95 chars — inclua keyword principal + benefício + preço",
-  "pinterest_description": "descrição Pin 450-500 chars — storytelling compra inteligente, benefícios específicos, urgência, CTA, 8-10 hashtags relevantes como #achadinhos #aliexpress #ofertasaliexpress #comprasonline #achados #brasil #fretegratis #desconto #promoção #diadeofertas",
-  "pinterest_alt_text": "alt text descritivo para SEO de imagem max 500 chars — descreve o produto detalhadamente para acessibilidade e busca",
-  "pinterest_keywords": ["keyword1","keyword2","keyword3","keyword4","keyword5"],
-  "telegram_text": "mensagem Telegram HTML max 900 chars — emoji chamativo título em <b>negrito</b> preço destacado 3 características com emoji CTA urgente link",
-  "seo_score_notes": "breve análise do potencial de tráfego"
-}}"""
+JSON SOMENTE:
+{{"pinterest_title":"titulo Pin SEO max 95 chars keyword+beneficio+preco","pinterest_description":"descricao Pin 450 chars PT emojis beneficios urgencia CTA 8 hashtags #achadinhos #aliexpress #oferta #desconto #brasil #comprasonline #fretegratis #promocao","pinterest_alt_text":"alt text SEO descritivo max 300 chars","telegram_text":"mensagem HTML max 800 chars emoji <b>titulo</b> preco desconto 3 beneficios CTA link"}}"""
 
     try:
         resp = http_post(
             "https://api.anthropic.com/v1/messages",
-            {
-                "model": "claude-sonnet-4-6",
-                "max_tokens": 1000,
-                "messages": [{"role": "user", "content": prompt}]
-            },
+            {"model":"claude-sonnet-4-6","max_tokens":800,
+             "messages":[{"role":"user","content":prompt}]},
             {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"}
         )
-        text = ""
-        for block in resp.get("content", []):
-            if block.get("type") == "text":
-                text = block["text"]
-        clean = text.replace("```json","").replace("```","").strip()
-        content = json.loads(clean)
-        content["aff_url_pin"] = aff_url_pin
-        content["aff_url_tg"]  = aff_url_tg
-        content["image_url"]   = img
-        content["product"]     = product
-        add_log(f"✅ Conteúdo gerado: {title[:40]}...", "ok")
+        text = next((b["text"] for b in resp.get("content",[]) if b.get("type")=="text"), "")
+        content = json.loads(text.replace("```json","").replace("```","").strip())
+        content.update({"aff_url_pin":aff_pin,"aff_url_tg":aff_tg,"image_url":img,"product":product})
+        add_log(f"Claude OK: {title[:35]}...", "ok")
         return content
     except Exception as e:
         add_log(f"Claude erro: {e}", "warn")
         return {
             "pinterest_title": f"{title[:80]} — R$ {sale} (-{disc}%)",
-            "pinterest_description": f"🔥 Achado incrível! {title} por apenas R$ {sale}!\n\n✅ {rate} de aprovação\n💰 Economia de R$ {round(orig-sale,2)}\n\n#achadinhos #aliexpress #oferta #desconto #brasil #comprasonline",
-            "pinterest_alt_text": f"Produto AliExpress: {title}. Preço: R$ {sale}. Avaliação: {rate}",
-            "pinterest_keywords": ["achadinhos","aliexpress","oferta","desconto","brasil"],
-            "telegram_text": f"🔥 <b>{title}</b>\n\n💰 R$ {sale} (-{disc}%)\n⭐ {rate} de aprovação\n\n<a href='{aff_url_tg}'>🛒 Comprar agora</a>",
-            "aff_url_pin": aff_url_pin,
-            "aff_url_tg":  aff_url_tg,
-            "image_url":   img,
-            "product":     product,
+            "pinterest_description": f"Achado! {title} por R$ {sale}\n#achadinhos #aliexpress #oferta #brasil",
+            "pinterest_alt_text": f"Produto AliExpress: {title}",
+            "telegram_text": f"🔥 <b>{title}</b>\n\n💰 R$ {sale} (-{disc}%)\n⭐ {rate}\n\n<a href='{aff_tg}'>Comprar</a>",
+            "aff_url_pin":aff_pin,"aff_url_tg":aff_tg,"image_url":img,"product":product,
         }
 
-# ── Step 4a: Publish Pinterest ─────────────────────────────────────────────────
 def publish_pinterest(content):
     if not PIN_TOKEN or not PIN_BOARD_ID:
-        return {"ok": False, "simulated": True, "ch": "pinterest"}
+        return {"ok":False,"simulated":True,"ch":"pinterest"}
     try:
         resp = http_post(
             "https://api.pinterest.com/v5/pins",
-            {
-                "board_id": PIN_BOARD_ID,
-                "title": content["pinterest_title"],
-                "description": content["pinterest_description"],
-                "alt_text": content["pinterest_alt_text"],
-                "link": content["aff_url_pin"],
-                "media_source": {
-                    "source_type": "image_url",
-                    "url": content["image_url"]
-                }
-            },
-            {"Authorization": f"Bearer {PIN_TOKEN}"}
+            {"board_id":PIN_BOARD_ID,"title":content["pinterest_title"],
+             "description":content["pinterest_description"],
+             "alt_text":content["pinterest_alt_text"],
+             "link":content["aff_url_pin"],
+             "media_source":{"source_type":"image_url","url":content["image_url"]}},
+            {"Authorization":f"Bearer {PIN_TOKEN}"}
         )
-        pin_id = resp.get("id", "")
-        add_log(f"✅ Pinterest Pin #{pin_id}", "ok")
-        return {"ok": True, "ch": "pinterest", "pin_id": pin_id,
-                "url": f"https://pinterest.com/pin/{pin_id}"}
+        pid = resp.get("id","")
+        add_log(f"Pinterest Pin #{pid}", "ok")
+        return {"ok":True,"ch":"pinterest","pin_id":pid,"url":f"https://pinterest.com/pin/{pid}"}
     except Exception as e:
         add_log(f"Pinterest erro: {e}", "err")
-        return {"ok": False, "ch": "pinterest", "error": str(e)}
+        return {"ok":False,"ch":"pinterest","error":str(e)}
 
-# ── Step 4b: Publish Telegram ──────────────────────────────────────────────────
 def publish_telegram(content):
     if not TG_TOKEN:
-        return {"ok": False, "simulated": True, "ch": "telegram"}
+        return {"ok":False,"simulated":True,"ch":"telegram"}
     try:
-        # Send photo + caption for better engagement
-        img_url = content["image_url"]
-        tg_text = content["telegram_text"]
-
-        # Try sendPhoto first, fallback to sendMessage
         try:
             resp = http_post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
-                {
-                    "chat_id": TG_CHANNEL,
-                    "photo": img_url,
-                    "caption": tg_text,
-                    "parse_mode": "HTML"
-                }
+                {"chat_id":TG_CHANNEL,"photo":content["image_url"],
+                 "caption":content["telegram_text"],"parse_mode":"HTML"}
             )
         except Exception:
-            # Fallback: send text only if image fails
             resp = http_post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                {
-                    "chat_id": TG_CHANNEL,
-                    "text": tg_text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": False
-                }
+                {"chat_id":TG_CHANNEL,"text":content["telegram_text"],
+                 "parse_mode":"HTML","disable_web_page_preview":False}
             )
-
         if resp.get("ok"):
-            msg_id = resp.get("result", {}).get("message_id", "")
-            add_log(f"✅ Telegram msg #{msg_id}", "ok")
-            return {"ok": True, "ch": "telegram", "msg_id": msg_id,
-                    "url": f"https://t.me/{TG_CHANNEL.replace('@','')}"}
-        else:
-            raise Exception(resp.get("description", "Unknown error"))
+            mid = resp.get("result",{}).get("message_id","")
+            add_log(f"Telegram msg #{mid}", "ok")
+            return {"ok":True,"ch":"telegram","msg_id":mid,
+                    "url":f"https://t.me/{TG_CHANNEL.replace('@','')}"}
+        raise Exception(resp.get("description","error"))
     except Exception as e:
         add_log(f"Telegram erro: {e}", "err")
-        return {"ok": False, "ch": "telegram", "error": str(e)}
+        return {"ok":False,"ch":"telegram","error":str(e)}
 
-# ── Main pipeline ──────────────────────────────────────────────────────────────
 def run_pipeline(manual=False):
     brt = get_brt()
-    keyword = KEYWORDS[brt.weekday() % 7]  # weekday 0=Mon, adjust to our 0=Sun
-    # Python weekday: 0=Mon...6=Sun, our array: 0=Sun...6=Sat
     day_idx = (brt.weekday() + 1) % 7
     keyword = KEYWORDS[day_idx]
-
-    trigger = "MANUAL" if manual else "AUTO"
-    add_log(f"🚀 Pipeline {trigger} — keyword: '{keyword}'", "ok")
-
-    products = fetch_products(keyword, count=2)
+    add_log(f"Pipeline {'MANUAL' if manual else 'AUTO'} — '{keyword}'", "ok")
+    products = fetch_products(keyword, n=2)
     results = []
-
-    for product in products:
-        try:
-            content = generate_content(product, keyword)
-            r_pin = publish_pinterest(content)
-            r_tg  = publish_telegram(content)
-            results.append({"product": product.get("product_title","")[:50],
-                            "pinterest": r_pin, "telegram": r_tg,
-                            "content": {
-                                "title": content["pinterest_title"],
-                                "description": content["pinterest_description"][:200],
-                                "image": content["image_url"],
-                            }})
-            if r_pin.get("ok"): stats["today"] += 1; stats["total"] += 1
-        except Exception as e:
-            add_log(f"Erro produto: {e}", "err")
-            results.append({"error": str(e)})
-
-    stats["last_run"] = brt.strftime("%H:%M:%S BRT")
-    ok_count = sum(1 for r in results if r.get("pinterest",{}).get("ok") or r.get("telegram",{}).get("ok"))
-    add_log(f"🎉 Concluído — {ok_count}/{len(results)*2} publicações OK", "ok")
+    for p in products:
+        content = generate_content(p, keyword)
+        r_pin = publish_pinterest(content)
+        r_tg  = publish_telegram(content)
+        if r_pin.get("ok"): stats["today"] += 1; stats["total"] += 1
+        results.append({
+            "product": p.get("product_title","")[:50],
+            "pinterest": r_pin, "telegram": r_tg,
+            "content": {"title": content.get("pinterest_title",""),
+                        "description": content.get("pinterest_description","")[:200],
+                        "image": content.get("image_url","")}
+        })
+    stats["last_run"] = brt.strftime("%H:%M BRT")
+    add_log(f"Concluido — {len(results)} produto(s)", "ok")
     return results
 
-# ── Scheduler (runs in background thread) ────────────────────────────────────
-def scheduler_loop():
-    """Checks every minute if it's a peak slot and runs pipeline."""
+def scheduler():
+    fired = set()
     while True:
         try:
             brt = get_brt()
             hhmm = brt.strftime("%H:%M")
-            day  = (brt.weekday() + 1) % 7  # convert to Sun=0
-            if hhmm in PEAK_SCHEDULE.get(day, []):
-                add_log(f"⏰ Horário de pico: {hhmm} BRT", "ok")
-                run_pipeline(manual=False)
-                time.sleep(61)  # avoid double-trigger in same minute
+            day  = (brt.weekday() + 1) % 7
+            key  = f"{day}-{hhmm}"
+            if hhmm in PEAK.get(day, []) and key not in fired:
+                fired.add(key)
+                add_log(f"Pico: {hhmm} BRT — publicando!", "ok")
+                run_pipeline()
+            # Clear fired keys every hour
+            if brt.minute == 0 and brt.second < 30:
+                fired.clear()
         except Exception as e:
-            add_log(f"Scheduler erro: {e}", "err")
+            add_log(f"Scheduler: {e}", "err")
         time.sleep(30)
 
-# Start scheduler in background
-scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True)
-scheduler_thread.start()
+threading.Thread(target=scheduler, daemon=True).start()
 
-# ── Flask routes ──────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return send_from_directory("static", "index.html")
 
+@app.route("/ping")
+def ping():
+    return jsonify({"status":"ok","service":"PinAgent Cloud"})
+
 @app.route("/api/run", methods=["POST"])
 def api_run():
     results = run_pipeline(manual=True)
-    return jsonify({"ok": True, "results": results})
+    return jsonify({"ok":True,"results":results})
 
 @app.route("/api/status")
 def api_status():
     brt = get_brt()
     day = (brt.weekday() + 1) % 7
     hhmm = brt.strftime("%H:%M")
-    peak_slots = PEAK_SCHEDULE.get(day, [])
-    next_slots = []
+    slots = []
     for d in range(7):
         idx = (day + d) % 7
-        for slot in PEAK_SCHEDULE.get(idx, []):
-            next_slots.append({
-                "day": ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"][idx],
-                "time": slot,
-                "keyword": KEYWORDS[idx]
-            })
+        for t in PEAK.get(idx, []):
+            slots.append({"day":DAYS[idx],"time":t,"keyword":KEYWORDS[idx]})
     return jsonify({
         "brt_time": hhmm,
-        "brt_day": ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"][day],
+        "brt_day": DAYS[day],
         "keyword_today": KEYWORDS[day],
-        "is_peak": hhmm in peak_slots,
-        "next_slots": next_slots[:8],
+        "is_peak": hhmm in PEAK.get(day, []),
+        "next_slots": slots[:8],
         "stats": stats,
         "logs": logs[-30:],
         "config": {
@@ -383,15 +279,8 @@ def api_status():
         }
     })
 
-@app.route("/api/logs")
-def api_logs():
-    return jsonify(logs[-50:])
-
-@app.route("/ping")
-def ping():
-    return jsonify({"status": "ok", "service": "PinAgent Cloud"})
+add_log("PinAgent Cloud started", "ok")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    add_log(f"PinAgent Cloud started on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port)
