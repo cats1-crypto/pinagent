@@ -1,7 +1,7 @@
 import os, json, hashlib, urllib.parse, urllib.request, ssl, threading, time
 from flask import Flask, jsonify, request
-from datetime import datetime, timezone, timedelta
 from telegram_templates import build_telegram_message
+from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__, static_folder="static")
 ctx = ssl.create_default_context()
@@ -20,7 +20,7 @@ BLOGGER_CLIENT  = os.environ.get("BLOGGER_CLIENT_ID", "")
 BLOGGER_SECRET  = os.environ.get("BLOGGER_CLIENT_SECRET", "")
 BLOGGER_BLOG_ID = os.environ.get("BLOGGER_BLOG_ID", "2781402232561095495")
 BUFFER_TOKEN    = os.environ.get("BUFFER_TOKEN", "")
-BUFFER_PROFILES = os.environ.get("BUFFER_PROFILES", "")
+BUFFER_PROFILES = os.environ.get("BUFFER_PROFILES", "")  # comma-separated profile IDs
 
 PEAK = {
     0: ["09:00","12:00","20:00","21:00"],
@@ -123,6 +123,7 @@ def generate_content(product, keyword):
             "pinterest_title": f"{title[:80]} — R$ {sale} (-{disc}%)",
             "pinterest_description": f"Achado incrível! {title} por R$ {sale}\n#achadinhos #aliexpress #oferta #desconto #brasil",
             "pinterest_alt_text": f"Produto AliExpress: {title}. Preço R$ {sale}",
+            "telegram_text": f"🔥 <b>{title}</b>\n\n💰 R$ {sale} (-{disc}%)\n⭐ {rate}\n\n<a href='{aff_tg}'>Comprar</a>",
             "aff_url_pin": aff_pin, "aff_url_tg": aff_tg, "image_url": img, "product": product,
         }
 
@@ -132,7 +133,7 @@ Preco: R$ {sale} (era R$ {orig}, -{disc}%)
 Avaliacao: {rate} | Keyword: {keyword}
 Link Pinterest: {aff_pin} | Link Telegram: {aff_tg}
 JSON SOMENTE:
-{{"pinterest_title":"titulo Pin SEO max 95 chars keyword+beneficio+preco","pinterest_description":"descricao Pin 450 chars PT emojis beneficios urgencia CTA 8 hashtags #achadinhos #aliexpress #oferta #desconto #brasil #comprasonline #fretegratis #promocao","pinterest_alt_text":"alt text SEO descritivo max 300 chars"}}"""
+{{"pinterest_title":"titulo Pin SEO max 95 chars keyword+beneficio+preco","pinterest_description":"descricao Pin 450 chars PT emojis beneficios urgencia CTA 8 hashtags #achadinhos #aliexpress #oferta #desconto #brasil #comprasonline #fretegratis #promocao","pinterest_alt_text":"alt text SEO descritivo max 300 chars","telegram_text":"mensagem HTML max 800 chars emoji <b>titulo</b> preco desconto 3 beneficios CTA link"}}"""
 
     try:
         resp = http_post(
@@ -152,6 +153,7 @@ JSON SOMENTE:
             "pinterest_title": f"{title[:80]} — R$ {sale} (-{disc}%)",
             "pinterest_description": f"Achado! {title} por R$ {sale}\n#achadinhos #aliexpress #oferta #brasil",
             "pinterest_alt_text": f"Produto AliExpress: {title}",
+            "telegram_text": f"🔥 <b>{title}</b>\n\n💰 R$ {sale} (-{disc}%)\n⭐ {rate}\n\n<a href='{aff_tg}'>Comprar</a>",
             "aff_url_pin":aff_pin,"aff_url_tg":aff_tg,"image_url":img,"product":product,
         }
 
@@ -175,40 +177,25 @@ def publish_pinterest(content):
         add_log(f"Pinterest erro: {e}", "err")
         return {"ok":False,"ch":"pinterest","error":str(e)}
 
-def _build_tg_product(content):
-    """Converte estrutura interna do agent para formato do telegram_templates."""
-    product = content.get("product", {})
-    sale    = float(product.get("sale_price", 0) or 0)
-    orig    = float(product.get("original_price", 0) or 0)
-    disc    = round((1 - sale / orig) * 100) if orig > 0 else 0
-    rate_raw = product.get("evaluate_rate", "4.5").replace("%", "")
-    # evaluate_rate vem como "96%" → convertemos para escala /5
-    try:
-        rate_num = float(rate_raw)
-        rating = f"{rate_num/20:.1f}" if rate_num > 5 else rate_raw
-    except Exception:
-        rating = "4.8"
-    return {
-        "title":              product.get("product_title", ""),
-        "price":              sale,
-        "price_brl":          f"R$ {sale:.2f}".replace(".", ","),
-        "original_price_brl": f"R$ {orig:.2f}".replace(".", ","),
-        "discount":           str(disc),
-        "rating":             rating,
-        "reviews":            "500+",
-        "affiliate_link":     content.get("aff_url_tg", ""),
-        "category":           "electronics",
-    }
-
 def publish_telegram(content):
     if not TG_TOKEN:
         return {"ok":False,"simulated":True,"ch":"telegram"}
     try:
-        # ✅ Usa template variado automaticamente (escolha inteligente por hora BRT)
-        tg_product = _build_tg_product(content)
-        caption = build_telegram_message(tg_product, template_type="auto")
-        add_log(f"Telegram template selecionado automaticamente", "info")
-
+        # ✅ قوالب متنوعة بدل النص الثابت
+        product = content.get("product", {})
+        ali_product = {
+            "title":    product.get("product_title", ""),
+            "price":    float(product.get("sale_price", 0) or 0),
+            "price_brl": f"R$ {product.get('sale_price','0')}",
+            "original_price_brl": f"R$ {product.get('original_price','0')}",
+            "discount": str(round((1 - float(product.get("sale_price",1) or 1) /
+                           float(product.get("original_price",1) or 1)) * 100)),
+            "rating":   product.get("evaluate_rate","4.5").replace("%",""),
+            "reviews":  "500+",
+            "affiliate_link": content.get("aff_url_tg",""),
+            "category": "electronics",
+        }
+        caption = build_telegram_message(ali_product, template_type="auto")
         try:
             resp = http_post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
@@ -218,7 +205,7 @@ def publish_telegram(content):
         except Exception:
             resp = http_post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                {"chat_id":TG_CHANNEL,"text":caption,
+                {"chat_id":TG_CHANNEL,"text":content["telegram_text"],
                  "parse_mode":"HTML","disable_web_page_preview":False}
             )
         if resp.get("ok"):
@@ -233,6 +220,7 @@ def publish_telegram(content):
 
 
 def refresh_blogger_token():
+    """Use refresh token to get new access token."""
     global BLOGGER_TOKEN
     if not BLOGGER_REFRESH or not BLOGGER_CLIENT or not BLOGGER_SECRET:
         return False
@@ -250,6 +238,7 @@ def refresh_blogger_token():
         return False
 
 def generate_blogger_post(content, keyword):
+    """Generate full HTML blog post for Blogger."""
     product = content.get("product", {})
     title   = product.get("product_title","")
     sale    = product.get("sale_price","0")
@@ -291,6 +280,7 @@ def publish_blogger(content, keyword):
     global BLOGGER_TOKEN
     if not BLOGGER_BLOG_ID:
         return {"ok":False,"simulated":True,"ch":"blogger"}
+    # Refresh token if needed
     if not BLOGGER_TOKEN:
         if not refresh_blogger_token():
             return {"ok":False,"simulated":True,"ch":"blogger","error":"No token"}
@@ -312,6 +302,7 @@ def publish_blogger(content, keyword):
         return {"ok":True,"ch":"blogger","post_id":post_id,"url":post_url}
     except Exception as e:
         err = str(e)
+        # Token expired — refresh and retry
         if "401" in err:
             add_log("Blogger token expirado — renovando...", "warn")
             if refresh_blogger_token():
@@ -319,12 +310,15 @@ def publish_blogger(content, keyword):
         add_log(f"Blogger erro: {err}", "err")
         return {"ok":False,"ch":"blogger","error":err}
 
+
 def publish_buffer(content, keyword):
+    """Publish to Buffer — schedules posts for Facebook, Instagram, Twitter."""
     if not BUFFER_TOKEN:
         return {"ok": False, "simulated": True, "ch": "buffer"}
     try:
         profile_ids = [p.strip() for p in BUFFER_PROFILES.split(",") if p.strip()]
         if not profile_ids:
+            # Auto-fetch profile IDs
             req = urllib.request.Request("https://api.bufferapp.com/1/profiles.json")
             req.add_header("Authorization", f"Bearer {BUFFER_TOKEN}")
             with urllib.request.urlopen(req, context=ctx, timeout=15) as r:
@@ -341,26 +335,33 @@ def publish_buffer(content, keyword):
         disc    = round((1-float(sale)/float(orig))*100) if float(orig)>0 else 0
         aff_url = content.get("aff_url_pin", "")
         img     = content.get("image_url", "")
-        rate    = product.get("evaluate_rate", "95%")
 
+        rate = product.get("evaluate_rate", "95%")
         lines_text = [
-            "Achado incrivel!", "",
-            str(title), "",
+            "Achado incrivel!",
+            "",
+            str(title),
+            "",
             "R$ " + str(sale) + " (-" + str(disc) + "%)",
-            "Avaliacao: " + rate, "",
-            "Compre aqui: " + str(aff_url), "",
+            "Avaliacao: " + rate,
+            "",
+            "Compre aqui: " + str(aff_url),
+            "",
             "#achadinhos #aliexpress #oferta #desconto #brasil #comprasonline"
         ]
         text = "\n".join(lines_text)
 
         results = []
-        for pid in profile_ids[:3]:
+        for pid in profile_ids[:3]:  # max 3 profiles
             try:
                 resp = http_post(
                     "https://api.bufferapp.com/1/updates/create.json",
-                    {"text": text, "profile_ids[]": pid,
-                     "media[link]": aff_url, "media[picture]": img,
-                     "media[title]": title[:100], "now": True},
+                    {"text": text,
+                     "profile_ids[]": pid,
+                     "media[link]": aff_url,
+                     "media[picture]": img,
+                     "media[title]": title[:100],
+                     "now": True},
                     {"Authorization": f"Bearer {BUFFER_TOKEN}"}
                 )
                 if resp.get("success"):
@@ -385,17 +386,14 @@ def run_pipeline(manual=False):
     results = []
     for p in products:
         content = generate_content(p, keyword)
-        r_pin    = publish_pinterest(content)
-        r_tg     = publish_telegram(content)
+        r_pin = publish_pinterest(content)
+        r_tg  = publish_telegram(content)
         r_blog   = publish_blogger(content, keyword)
         r_buffer = publish_buffer(content, keyword)
-        if r_pin.get("ok") or r_tg.get("ok"):
-            stats["today"] += 1
-            stats["total"] += 1
+        if r_pin.get("ok") or r_tg.get("ok"): stats["today"] += 1; stats["total"] += 1
         results.append({
             "product": p.get("product_title","")[:50],
-            "pinterest": r_pin, "telegram": r_tg,
-            "blogger": r_blog, "buffer": r_buffer,
+            "pinterest": r_pin, "telegram": r_tg, "blogger": r_blog, "buffer": r_buffer,
             "content": {"title": content.get("pinterest_title",""),
                         "description": content.get("pinterest_description","")[:200],
                         "image": content.get("image_url","")}
@@ -408,7 +406,7 @@ def scheduler():
     fired = set()
     while True:
         try:
-            brt  = get_brt()
+            brt = get_brt()
             hhmm = brt.strftime("%H:%M")
             day  = (brt.weekday() + 1) % 7
             key  = f"{day}-{hhmm}"
@@ -416,6 +414,7 @@ def scheduler():
                 fired.add(key)
                 add_log(f"Pico: {hhmm} BRT — publicando!", "ok")
                 run_pipeline()
+            # Clear fired keys every hour
             if brt.minute == 0 and brt.second < 30:
                 fired.clear()
         except Exception as e:
@@ -450,6 +449,7 @@ html,body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMa
 .tab svg{width:21px;height:21px;}
 .sc{display:none;padding:16px;}
 .sc.on{display:block;}
+/* Ring */
 #ring-wrap{position:relative;width:150px;height:150px;margin:20px auto 0;}
 #ring-svg{position:absolute;inset:0;width:100%;height:100%;}
 .rt{fill:none;stroke:var(--bd);stroke-width:3;}
@@ -460,15 +460,23 @@ html,body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMa
 #ring-cd{font-family:var(--mono);font-size:14px;font-weight:700;margin-top:2px;}
 @keyframes pulse{0%{transform:scale(1);opacity:.5;}50%{transform:scale(1.1);opacity:.15;}100%{transform:scale(1);opacity:.5;}}
 .rpulse{position:absolute;inset:8px;border-radius:50%;border:2px solid var(--red);animation:pulse 2s ease-in-out infinite;pointer-events:none;}
+/* Cards */
 .card{background:var(--s);border:1px solid var(--bd);border-radius:14px;padding:14px;margin-bottom:10px;}
 .ctitle{font-size:10px;font-weight:700;color:var(--mu);letter-spacing:.1em;text-transform:uppercase;margin-bottom:10px;}
+/* Stats */
 .srow{display:flex;gap:8px;margin-bottom:10px;}
 .scard{flex:1;background:var(--s);border:1px solid var(--bd);border-radius:12px;padding:12px;text-align:center;}
 .sval{font-size:22px;font-weight:800;line-height:1;}
 .slbl{font-size:10px;color:var(--mu);margin-top:3px;}
+/* Toggle */
 .trow{display:flex;align-items:center;justify-content:space-between;}
 .tlbl{font-size:14px;font-weight:600;}
 .tsub{font-size:11px;color:var(--mu);margin-top:2px;}
+.tsw{width:48px;height:26px;border-radius:13px;background:var(--bd);position:relative;transition:background .25s;flex-shrink:0;cursor:pointer;}
+.tsw.on{background:var(--red);}
+.tsw::after{content:'';position:absolute;width:20px;height:20px;background:#fff;border-radius:10px;top:3px;left:3px;transition:left .25s;}
+.tsw.on::after{left:25px;}
+/* Slots */
 .slrow{display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--bd);}
 .slrow:last-child{border-bottom:none;}
 .slday{font-size:11px;color:var(--mu);width:22px;}
@@ -478,18 +486,22 @@ html,body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMa
 .peak{background:rgba(230,0,35,.15);color:var(--red);}
 .nxt{background:rgba(255,107,53,.15);color:var(--or);}
 .soon{background:var(--s2);color:var(--fa);}
+/* Run btn */
 #runbtn{width:100%;padding:15px;border-radius:13px;font-size:14px;font-weight:700;letter-spacing:.02em;background:var(--red);color:#fff;border:none;cursor:pointer;transition:all .2s;margin-top:4px;}
 #runbtn:disabled{background:var(--bd);color:var(--fa);cursor:not-allowed;}
 #runbtn:active:not(:disabled){transform:scale(.98);}
+/* Config status dots */
 .cfg-row{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--bd);}
 .cfg-row:last-child{border-bottom:none;}
 .cfg-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
 .dot-ok{background:var(--gr);}
 .dot-no{background:#F87171;}
+/* Log */
 #logbox{background:var(--s2);border-radius:10px;padding:10px;height:170px;overflow-y:auto;font-family:var(--mono);font-size:11px;}
 .ll{padding:2px 0;line-height:1.6;}
 .lok{color:var(--gr);}.lerr{color:#F87171;}.lwarn{color:var(--yw);}.linfo{color:var(--mu);}
 .lts{color:var(--fa);margin-right:5px;}
+/* Results */
 .res{background:var(--s2);border-radius:10px;padding:11px;margin-bottom:7px;border-left:3px solid var(--bd);}
 .res.ok{border-left-color:var(--gr);}
 .res.demo{border-left-color:var(--yw);}
@@ -499,6 +511,7 @@ html,body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMa
 .rdesc{font-size:11px;color:var(--mu);margin-top:3px;line-height:1.5;}
 .rimg{width:60px;height:60px;object-fit:cover;border-radius:8px;float:right;margin-left:8px;}
 .rlink{font-size:11px;color:var(--red);margin-top:5px;text-decoration:none;display:block;}
+/* Week grid */
 .wday{margin-bottom:14px;}
 .wlbl{font-size:11px;font-weight:700;color:var(--mu);letter-spacing:.07em;text-transform:uppercase;margin-bottom:7px;display:flex;align-items:center;gap:7px;}
 .today-b{font-size:8px;background:var(--red);color:#fff;padding:2px 5px;border-radius:3px;}
@@ -511,8 +524,6 @@ html,body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMa
 ::-webkit-scrollbar{width:3px;}::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px;}
 #peak-bar{display:none;background:var(--red);padding:8px;text-align:center;font-size:11px;font-weight:700;letter-spacing:.05em;}
 #peak-bar.on{display:block;}
-/* Template badge no log */
-.tpl-badge{display:inline-block;font-size:9px;background:rgba(255,107,53,.15);color:var(--or);border:1px solid rgba(255,107,53,.3);padding:1px 6px;border-radius:4px;margin-left:4px;font-weight:700;}
 </style>
 </head>
 <body>
@@ -527,6 +538,7 @@ html,body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMa
     </div>
   </div>
   <div id="content">
+    <!-- HOME -->
     <div id="sc-home" class="sc on">
       <div id="ring-wrap">
         <div class="rpulse" id="rpulse"></div>
@@ -544,8 +556,9 @@ html,body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMa
         <div class="srow">
           <div class="scard"><div class="sval" id="st-today" style="color:var(--red)">0</div><div class="slbl">Hoje</div></div>
           <div class="scard"><div class="sval" id="st-total" style="color:var(--or)">0</div><div class="slbl">Total</div></div>
-          <div class="scard"><div class="sval" style="color:var(--gr)">7</div><div class="slbl">Templates</div></div>
+          <div class="scard"><div class="sval" style="color:var(--gr)">26</div><div class="slbl">Slots/sem</div></div>
         </div>
+        <!-- Config status -->
         <div class="card" id="cfg-status">
           <div class="ctitle">Status das APIs</div>
           <div class="cfg-row"><span>Anthropic Claude</span><div class="cfg-dot dot-no" id="d-anthropic"></div></div>
@@ -569,25 +582,32 @@ html,body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMa
         </div>
       </div>
     </div>
+    <!-- SCHEDULE -->
     <div id="sc-schedule" class="sc">
       <div class="ctitle" style="padding-top:4px">Grade Semanal — Horários de Pico BRT</div>
       <div id="week-grid"></div>
     </div>
+    <!-- INFO -->
     <div id="sc-info" class="sc">
       <div class="card">
         <div class="ctitle">☁️ Como funciona</div>
         <div style="font-size:12px;color:var(--mu);line-height:1.8">
-          <p>Este serviço roda 24/7 na nuvem (Render.com).</p><br>
+          <p>Este serviço roda 24/7 na nuvem (Render.com).</p>
+          <br>
           <p><b style="color:var(--tx)">Pipeline automático:</b></p>
           <p>① AliExpress API → produtos do dia</p>
-          <p>② Claude AI → título SEO + descrição + hashtags</p>
+          <p>② Claude AI → título SEO + descrição + hashtags + texto Telegram</p>
           <p>③ Pinterest API → Pin com imagem do produto</p>
-          <p>④ Telegram Bot → <b style="color:var(--or)">7 templates rotativos</b> escolhidos por hora BRT</p>
-          <p>⑤ Blogger → post HTML completo</p>
-          <p>⑥ Buffer → Facebook / Instagram / Twitter</p><br>
-          <p><b style="color:var(--tx)">Templates Telegram (automático por hora):</b></p>
-          <p>😱 Choque de preço &nbsp;⚡ Relâmpago &nbsp;🔍 Achado</p>
-          <p>💡 Vale a pena? &nbsp;📊 Enquete &nbsp;🌙 Madrugada &nbsp;🏆 Top 5</p>
+          <p>④ Telegram Bot → mensagem com foto para o canal</p>
+          <br>
+          <p><b style="color:var(--tx)">Horários:</b> baseados em dados de 2M+ posts do público brasileiro (BRT)</p>
+          <br>
+          <p><b style="color:var(--tx)">SEO de imagem:</b></p>
+          <p>• Alt text detalhado para busca visual</p>
+          <p>• Título com keyword principal + benefício</p>
+          <p>• 8-10 hashtags relevantes em português</p>
+          <br>
+          <p><b style="color:var(--tx)">Para configurar:</b> adicione as variáveis de ambiente no Render.com dashboard</p>
         </div>
       </div>
       <div class="card">
@@ -617,23 +637,200 @@ html,body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMa
   </nav>
 </div>
 <script>
-var PEAK=[{day:0,label:"Dom",slots:["09:00","12:00","20:00","21:00"]},{day:1,label:"Seg",slots:["12:00","15:00","20:00","21:00"]},{day:2,label:"Ter",slots:["09:00","13:00","20:00","21:00"]},{day:3,label:"Qua",slots:["10:00","14:00","19:00","21:00"]},{day:4,label:"Qui",slots:["10:00","12:00","19:00","20:00"]},{day:5,label:"Sex",slots:["20:00","21:00"]},{day:6,label:"Sáb",slots:["09:00","10:00","20:00","21:00"]}];
-var KW=["fone bluetooth sem fio","smartwatch barato 2024","cabo usb tipo c carga rapida","case celular transparente","led strip rgb quarto","organizador cozinha gaveta","brinquedo educativo crianca"];
-var DAYS=["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
-var DAYSFULL=["Domingo","Segunda","Terça","Quarta","Quinta","Sexta","Sábado"];
+var PEAK = [
+  {day:0,label:"Dom",slots:["09:00","12:00","20:00","21:00"]},
+  {day:1,label:"Seg",slots:["12:00","15:00","20:00","21:00"]},
+  {day:2,label:"Ter",slots:["09:00","13:00","20:00","21:00"]},
+  {day:3,label:"Qua",slots:["10:00","14:00","19:00","21:00"]},
+  {day:4,label:"Qui",slots:["10:00","12:00","19:00","20:00"]},
+  {day:5,label:"Sex",slots:["20:00","21:00"]},
+  {day:6,label:"Sáb",slots:["09:00","10:00","20:00","21:00"]},
+];
+var KW = ["fone bluetooth sem fio","smartwatch barato 2024","cabo usb tipo c carga rapida","case celular transparente","led strip rgb quarto","organizador cozinha gaveta","brinquedo educativo crianca"];
+var DAYS = ["Dom","Seg","Ter","Qua","Qui","Sex","Sáb"];
+var DAYSFULL = ["Domingo","Segunda","Terça","Quarta","Quinta","Sexta","Sábado"];
 function getBRT(){var n=new Date();return new Date(n.getTime()-3*3600000+n.getTimezoneOffset()*60000);}
 function hhmm(d){return ("0"+d.getHours()).slice(-2)+":"+("0"+d.getMinutes()).slice(-2);}
 function fmtMs(ms){ms=Math.max(0,ms);var h=Math.floor(ms/3600000),m=Math.floor((ms%3600000)/60000),s=Math.floor((ms%60000)/1000);return ("0"+h).slice(-2)+":"+("0"+m).slice(-2)+":"+("0"+s).slice(-2);}
-function getAllSlots(){var brt=getBRT(),r=[];PEAK.forEach(function(d){d.slots.forEach(function(t){var p=t.split(":"),dt=new Date(brt);dt.setHours(+p[0],+p[1],0,0);var diff=(d.day-brt.getDay()+7)%7;dt.setDate(dt.getDate()+diff);if(dt<=brt)dt.setDate(dt.getDate()+7);r.push({dt:dt,day:d.label,time:t,kw:KW[d.day],dayIdx:d.day});});});return r.sort(function(a,b){return a.dt-b.dt;});}
-function showTab(name){document.querySelectorAll(".sc").forEach(function(s){s.classList.remove("on");});document.querySelectorAll(".tab").forEach(function(b){b.classList.remove("on");});document.getElementById("sc-"+name).classList.add("on");document.getElementById("tab-"+name).classList.add("on");if(name==="schedule")renderWeek();}
-function addLog(msg,type){var box=document.getElementById("logbox");var brt=getBRT();var ts=hhmm(brt)+":"+("0"+brt.getSeconds()).slice(-2);var d=document.createElement("div");d.className="ll l"+(type||"info");d.innerHTML='<span class="lts">'+ts+'</span>'+msg;box.appendChild(d);box.scrollTop=box.scrollHeight;}
-function tick(){var brt=getBRT();var cur=hhmm(brt);document.getElementById("clock").textContent=cur;var dayIdx=brt.getDay();var isPeak=PEAK[dayIdx]&&PEAK[dayIdx].slots.indexOf(cur)>=0;document.getElementById("peak-bar").className=isPeak?"on":"";document.getElementById("kw-today").textContent=KW[dayIdx];document.getElementById("kw-day").textContent=DAYSFULL[dayIdx];var slots=getAllSlots();if(!slots.length)return;var next=slots[0];var ms=Math.max(0,next.dt.getTime()-brt.getTime());document.getElementById("ring-cd").textContent=fmtMs(ms);var circ=2*Math.PI*64;var prog=Math.min(1,1-ms/(3*3600000));var rp=document.getElementById("rprog");rp.style.strokeDashoffset=circ*(1-prog);rp.style.stroke=isPeak?"#22C55E":"#E60023";document.getElementById("rpulse").style.borderColor=isPeak?"#22C55E":"#E60023";document.getElementById("ring-icon").textContent=isPeak?"🔥":"📌";document.getElementById("ring-lbl").textContent=isPeak?"PICO ATIVO":"próximo slot";renderSlots(slots,cur);}
-function renderSlots(slots,cur){var list=document.getElementById("slots-list");list.innerHTML="";slots.slice(0,5).forEach(function(s,i){var brt=getBRT();var ms=Math.max(0,s.dt.getTime()-brt.getTime());var isNow=(i===0&&ms<60000);var row=document.createElement("div");row.className="slrow";var bc=isNow?"slbadge peak":i===0?"slbadge nxt":"slbadge soon";var bt=isNow?"🔥 AGORA":i===0?"PRÓXIMO":"em breve";row.innerHTML='<span class="slday">'+s.day+'</span><span class="sltime" style="color:'+(i===0?'var(--or)':'var(--tx)')+'">'+s.time+'</span><span class="slkw">'+s.kw+'</span><span class="'+bc+'">'+bt+'</span>';list.appendChild(row);});}
-function renderWeek(){var brt=getBRT();var curDay=brt.getDay();var cur=hhmm(brt);var g=document.getElementById("week-grid");g.innerHTML="";PEAK.forEach(function(d){var isT=d.day===curDay;var div=document.createElement("div");div.className="wday";var chips=d.slots.map(function(t){var isPast=isT&&t<cur;var isNow=isT&&t===cur;var cls=isNow?"chip now":isPast?"chip done":isT?"chip tod":"chip";return'<span class="'+cls+'">'+t+'</span>';}).join("");div.innerHTML='<div class="wlbl">'+DAYSFULL[d.day]+(isT?'<span class="today-b">HOJE</span>':'')+'</div><div class="chips">'+chips+'</div><div class="kwtag">📎 '+KW[d.day]+'</div>';g.appendChild(div);});}
-function pollStatus(){fetch("/api/status").then(function(r){return r.json();}).then(function(data){if(data.stats){document.getElementById("st-today").textContent=data.stats.today||0;document.getElementById("st-total").textContent=data.stats.total||0;}if(data.config){var map={"anthropic":"d-anthropic","aliexpress":"d-ali","pinterest":"d-pin","telegram":"d-tg","blogger":"d-blogger","buffer":"d-buffer"};Object.keys(map).forEach(function(k){var dot=document.getElementById(map[k]);if(dot)dot.className="cfg-dot "+(data.config[k]?"dot-ok":"dot-no");});}if(data.logs&&data.logs.length){var box=document.getElementById("logbox");var shown=box.querySelectorAll(".ll").length;data.logs.slice(shown).forEach(function(l){var d=document.createElement("div");d.className="ll l"+(l.level||"info");d.innerHTML='<span class="lts">'+l.ts+'</span>'+l.msg;box.appendChild(d);});box.scrollTop=box.scrollHeight;}}).catch(function(){});}
-function runNow(){var btn=document.getElementById("runbtn");btn.disabled=true;btn.textContent="⏳ Publicando...";addLog("🚀 Publicação manual iniciada...");fetch("/api/run",{method:"POST"}).then(function(r){return r.json();}).then(function(data){btn.disabled=false;btn.textContent="📌 Publicar agora";if(data.results)renderResults(data.results);}).catch(function(e){btn.disabled=false;btn.textContent="📌 Publicar agora";addLog("❌ Erro: "+e.message,"err");});}
-function renderResults(results){var list=document.getElementById("res-list");list.innerHTML="";results.forEach(function(r){if(r.error){var d=document.createElement("div");d.className="res err";d.innerHTML='<span class="rbadge" style="background:#F87171;color:#000">❌ ERRO</span><div class="rtitle">'+r.error+'</div>';list.appendChild(d);return;}var rPin=r.pinterest||{};var rTg=r.telegram||{};var content=r.content||{};var div=document.createElement("div");var ok=rPin.ok||rTg.ok;var sim=rPin.simulated||rTg.simulated;div.className="res "+(ok?"ok":sim?"demo":"err");var badges='';if(rPin.ok)badges+='<span class="rbadge" style="background:#22C55E;color:#000;margin-right:4px">📌 Pin #'+rPin.pin_id+'</span>';else if(rPin.simulated)badges+='<span class="rbadge" style="background:#F59E0B;color:#000;margin-right:4px">📌 Preview</span>';if(rTg.ok)badges+='<span class="rbadge" style="background:#22C55E;color:#000">📨 Msg #'+rTg.msg_id+'</span>';else if(rTg.simulated)badges+='<span class="rbadge" style="background:#F59E0B;color:#000">📨 Preview</span>';var imgHtml=content.image?'<img class="rimg" src="'+content.image+'" onerror="this.style.display=\'none\'">':'';div.innerHTML=badges+(imgHtml)+'<div class="rtitle">'+(content.title||r.product||"")+'</div>'+'<div class="rdesc">'+(content.description||"").slice(0,120)+'...</div>'+(rPin.url?'<a href="'+rPin.url+'" class="rlink" target="_blank">↗ Ver Pin no Pinterest</a>':'')+(rTg.url?'<a href="'+rTg.url+'" class="rlink" target="_blank">↗ Ver no Telegram</a>':'')+(r.blogger&&r.blogger.url?'<a href="'+r.blogger.url+'" class="rlink" target="_blank">↗ Ver no Blogger</a>':'')+(r.buffer&&r.buffer.ok?'<span style="font-size:11px;color:#22C55E;display:block;margin-top:4px">✅ Buffer: '+(r.buffer.profiles||1)+' perfil(s)</span>':'');list.appendChild(div);});document.getElementById("res-section").style.display="block";}
-setInterval(tick,1000);tick();setInterval(pollStatus,10000);pollStatus();
+function getAllSlots(){
+  var brt=getBRT(),r=[];
+  PEAK.forEach(function(d){d.slots.forEach(function(t){
+    var p=t.split(":"),dt=new Date(brt);
+    dt.setHours(+p[0],+p[1],0,0);
+    var diff=(d.day-brt.getDay()+7)%7;
+    dt.setDate(dt.getDate()+diff);
+    if(dt<=brt)dt.setDate(dt.getDate()+7);
+    r.push({dt:dt,day:d.label,time:t,kw:KW[d.day],dayIdx:d.day});
+  });});
+  return r.sort(function(a,b){return a.dt-b.dt;});
+}
+function showTab(name){
+  document.querySelectorAll(".sc").forEach(function(s){s.classList.remove("on");});
+  document.querySelectorAll(".tab").forEach(function(b){b.classList.remove("on");});
+  document.getElementById("sc-"+name).classList.add("on");
+  document.getElementById("tab-"+name).classList.add("on");
+  if(name==="schedule")renderWeek();
+}
+function addLog(msg,type){
+  var box=document.getElementById("logbox");
+  var brt=getBRT();
+  var ts=hhmm(brt)+":"+("0"+brt.getSeconds()).slice(-2);
+  var d=document.createElement("div");
+  d.className="ll l"+(type||"info");
+  d.innerHTML='<span class="lts">'+ts+'</span>'+msg;
+  box.appendChild(d);
+  box.scrollTop=box.scrollHeight;
+}
+function tick(){
+  var brt=getBRT();
+  var cur=hhmm(brt);
+  document.getElementById("clock").textContent=cur;
+  var dayIdx=brt.getDay();
+  var isPeak=PEAK[dayIdx]&&PEAK[dayIdx].slots.indexOf(cur)>=0;
+  document.getElementById("peak-bar").className=isPeak?"on":"";
+  document.getElementById("kw-today").textContent=KW[dayIdx];
+  document.getElementById("kw-day").textContent=DAYSFULL[dayIdx];
+  var slots=getAllSlots();
+  if(!slots.length)return;
+  var next=slots[0];
+  var ms=Math.max(0,next.dt.getTime()-brt.getTime());
+  document.getElementById("ring-cd").textContent=fmtMs(ms);
+  var circ=2*Math.PI*64;
+  var prog=Math.min(1,1-ms/(3*3600000));
+  var rp=document.getElementById("rprog");
+  rp.style.strokeDashoffset=circ*(1-prog);
+  rp.style.stroke=isPeak?"#22C55E":"#E60023";
+  document.getElementById("rpulse").style.borderColor=isPeak?"#22C55E":"#E60023";
+  document.getElementById("ring-icon").textContent=isPeak?"🔥":"📌";
+  document.getElementById("ring-lbl").textContent=isPeak?"PICO ATIVO":"próximo slot";
+  renderSlots(slots,cur);
+}
+function renderSlots(slots,cur){
+  var list=document.getElementById("slots-list");
+  list.innerHTML="";
+  slots.slice(0,5).forEach(function(s,i){
+    var brt=getBRT();
+    var ms=Math.max(0,s.dt.getTime()-brt.getTime());
+    var isNow=(i===0&&ms<60000);
+    var row=document.createElement("div");
+    row.className="slrow";
+    var bc=isNow?"slbadge peak":i===0?"slbadge nxt":"slbadge soon";
+    var bt=isNow?"🔥 AGORA":i===0?"PRÓXIMO":"em breve";
+    row.innerHTML='<span class="slday">'+s.day+'</span><span class="sltime" style="color:'+(i===0?'var(--or)':'var(--tx)')+'">'+s.time+'</span><span class="slkw">'+s.kw+'</span><span class="'+bc+'">'+bt+'</span>';
+    list.appendChild(row);
+  });
+}
+function renderWeek(){
+  var brt=getBRT();
+  var curDay=brt.getDay();
+  var cur=hhmm(brt);
+  var g=document.getElementById("week-grid");
+  g.innerHTML="";
+  PEAK.forEach(function(d){
+    var isT=d.day===curDay;
+    var div=document.createElement("div");
+    div.className="wday";
+    var chips=d.slots.map(function(t){
+      var isPast=isT&&t<cur;
+      var isNow=isT&&t===cur;
+      var cls=isNow?"chip now":isPast?"chip done":isT?"chip tod":"chip";
+      return '<span class="'+cls+'">'+t+'</span>';
+    }).join("");
+    div.innerHTML='<div class="wlbl">'+DAYSFULL[d.day]+(isT?'<span class="today-b">HOJE</span>':'')+'</div><div class="chips">'+chips+'</div><div class="kwtag">📎 '+KW[d.day]+'</div>';
+    g.appendChild(div);
+  });
+}
+// Poll server status every 10s
+function pollStatus(){
+  fetch("/api/status").then(function(r){return r.json();}).then(function(data){
+    // Update stats
+    if(data.stats){
+      document.getElementById("st-today").textContent=data.stats.today||0;
+      document.getElementById("st-total").textContent=data.stats.total||0;
+    }
+    // Update config dots
+    if(data.config){
+      ["anthropic","aliexpress","pinterest","telegram"].forEach(function(k){
+        var dot=document.getElementById("d-"+k.replace("aliexpress","ali").replace("pinterest","pin").replace("telegram","tg").replace("anthropic","anthropic"));
+        if(dot){dot.className="cfg-dot "+(data.config[k]?"dot-ok":"dot-no");}
+      });
+    }
+    // Update logs from server
+    if(data.logs&&data.logs.length){
+      var box=document.getElementById("logbox");
+      var last=box.lastChild;
+      var lastTs=last?last.querySelector(".lts"):null;
+      var lastTsText=lastTs?lastTs.textContent:"";
+      data.logs.forEach(function(l){
+        if(l.ts!==lastTsText){
+          var d=document.createElement("div");
+          d.className="ll l"+(l.level||"info");
+          d.innerHTML='<span class="lts">'+l.ts+'</span>'+l.msg;
+          box.appendChild(d);
+        }
+      });
+      box.scrollTop=box.scrollHeight;
+    }
+  }).catch(function(){});
+}
+// Run now
+function runNow(){
+  var btn=document.getElementById("runbtn");
+  btn.disabled=true;
+  btn.textContent="⏳ Publicando...";
+  addLog("🚀 Publicação manual iniciada...");
+  fetch("/api/run",{method:"POST"}).then(function(r){return r.json();}).then(function(data){
+    btn.disabled=false;
+    btn.textContent="📌 Publicar agora";
+    if(data.results) renderResults(data.results);
+  }).catch(function(e){
+    btn.disabled=false;
+    btn.textContent="📌 Publicar agora";
+    addLog("❌ Erro: "+e.message,"err");
+  });
+}
+function renderResults(results){
+  var list=document.getElementById("res-list");
+  list.innerHTML="";
+  results.forEach(function(r){
+    if(r.error){
+      var d=document.createElement("div");
+      d.className="res err";
+      d.innerHTML='<span class="rbadge" style="background:#F87171;color:#000">❌ ERRO</span><div class="rtitle">'+r.error+'</div>';
+      list.appendChild(d);
+      return;
+    }
+    // Pinterest result
+    var rPin=r.pinterest||{};
+    var rTg=r.telegram||{};
+    var content=r.content||{};
+    var div=document.createElement("div");
+    var ok=rPin.ok||rTg.ok;
+    var sim=rPin.simulated||rTg.simulated;
+    div.className="res "+(ok?"ok":sim?"demo":"err");
+    var badges='';
+    if(rPin.ok) badges+='<span class="rbadge" style="background:#22C55E;color:#000;margin-right:4px">📌 Pin #'+rPin.pin_id+'</span>';
+    else if(rPin.simulated) badges+='<span class="rbadge" style="background:#F59E0B;color:#000;margin-right:4px">📌 Preview</span>';
+    if(rTg.ok) badges+='<span class="rbadge" style="background:#22C55E;color:#000">📨 Msg #'+rTg.msg_id+'</span>';
+    else if(rTg.simulated) badges+='<span class="rbadge" style="background:#F59E0B;color:#000">📨 Preview</span>';
+    var imgHtml=content.image?'<img class="rimg" src="'+content.image+'" onerror="this.style.display=\\'none\\'">':'';
+    div.innerHTML=badges+
+      (imgHtml)+
+      '<div class="rtitle">'+( content.title||r.product||"")+'</div>'+
+      '<div class="rdesc">'+(content.description||"").slice(0,120)+'...</div>'+
+      (rPin.url?'<a href="'+rPin.url+'" class="rlink" target="_blank">↗ Ver Pin no Pinterest</a>':'')+
+      (rTg.url?'<a href="'+rTg.url+'" class="rlink" target="_blank">↗ Ver no Telegram</a>':'')+
+      (r.blogger&&r.blogger.url?'<a href="'+r.blogger.url+'" class="rlink" target="_blank">↗ Ver no Blogger</a>':'')+
+      (r.buffer&&r.buffer.ok?'<span style="font-size:11px;color:#22C55E;display:block;margin-top:4px">✅ Buffer: '+( r.buffer.profiles||1)+' perfil(s)</span>':'');
+    list.appendChild(div);
+  });
+  document.getElementById("res-section").style.display="block";
+}
+// Init
+setInterval(tick,1000);
+tick();
+setInterval(pollStatus,10000);
+pollStatus();
 </script>
 </body>
 </html>
@@ -680,7 +877,7 @@ def api_status():
         }
     })
 
-add_log("PinAgent Cloud started ✅ — 7 Telegram templates ativos", "ok")
+add_log("PinAgent Cloud started", "ok")
 if BLOGGER_REFRESH: refresh_blogger_token()
 
 if __name__ == "__main__":
