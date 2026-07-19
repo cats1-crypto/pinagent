@@ -24,6 +24,52 @@ BUFFER_PROFILES = os.environ.get("BUFFER_PROFILES", "")  # comma-separated Buffe
 
 BUFFER_API_URL = "https://api.buffer.com"
 
+POST_CHAR_LIMIT = 250
+
+# هاشتاغات ترند فـ البرازيل لقطاع achadinhos/aliexpress (كتتبدل بالتناوب باش
+# المنشورات ما تبقاش ديما بنفس الهاشتاغات).
+TRENDING_HASHTAGS_BR = [
+    "#achadinhos", "#achadinhosdodia", "#aliexpress", "#oferta",
+    "#promocao", "#desconto", "#comprasonline", "#tiktokmademebuyit",
+    "#viral", "#brasil", "#fretegratis", "#achadinhosaliexpress",
+]
+
+def pick_trending_hashtags(budget_chars, day_offset=0):
+    """
+    كتختار هاشتاغات ترند فـ البرازيل بقدر المساحة المتاحة (budget_chars) بلا
+    ما تتعداها. day_offset كيبدل نقطة البداية فـ القائمة باش تتنوع المنشورات.
+    """
+    if budget_chars <= 0:
+        return ""
+    n = len(TRENDING_HASHTAGS_BR)
+    rotated = TRENDING_HASHTAGS_BR[day_offset % n:] + TRENDING_HASHTAGS_BR[:day_offset % n]
+    chosen, used = [], 0
+    for tag in rotated:
+        add_len = len(tag) + (1 if chosen else 0)
+        if used + add_len > budget_chars:
+            continue
+        chosen.append(tag)
+        used += add_len
+    return " ".join(chosen)
+
+def build_capped_post(title, sale, disc, aff_url, max_len=POST_CHAR_LIMIT, day_offset=0):
+    """
+    كتبني منشور مختصر (Telegram أو Buffer/X) ما كيتعداش max_len حرف، بما فيه
+    السعر والرابط وهاشتاغات ترند فـ البرازيل. العنوان كيتقلص أولاً إلا خص المكان.
+    """
+    price_line = f"🔥 R$ {sale} (-{disc}%)"
+    cta = f"👉 {aff_url}"
+    # مساحة محجوزة للسعر + الرابط + الأسطر الفارغة بينهم
+    reserved = len(price_line) + len(cta) + 2
+    title_budget = max(15, max_len - reserved - 30)  # ~30 حرف محجوزين للهاشتاغات
+    short_title = title if len(title) <= title_budget else title[:max(0, title_budget - 1)].rstrip() + "…"
+
+    body = f"{price_line}\n{short_title}\n{cta}"
+    remaining = max_len - len(body) - 1  # -1 للسطر الفارغ قبل الهاشتاغات
+    hashtags = pick_trending_hashtags(remaining, day_offset)
+    post = body + (f"\n{hashtags}" if hashtags else "")
+    return post[:max_len]
+
 PEAK = {
     0: ["09:00","12:00","20:00","21:00"],
     1: ["12:00","15:00","20:00","21:00"],
@@ -181,12 +227,16 @@ def generate_content(product, keyword):
     if aff_pin == raw_url:
         add_log(f"⚠️ Link de afiliado NÃO gerado para {pid} — usando link normal (sem tracking)", "warn")
 
+    day_offset = get_brt().timetuple().tm_yday  # كيبدل الهاشتاغات كل يوم
+
     if not ANTHROPIC_KEY:
+        capped = build_capped_post(title, sale, disc, aff_tg, POST_CHAR_LIMIT, day_offset)
         return {
             "pinterest_title": f"{title[:80]} — R$ {sale} (-{disc}%)",
             "pinterest_description": f"Achado incrível! {title} por R$ {sale}\n#achadinhos #aliexpress #oferta #desconto #brasil",
             "pinterest_alt_text": f"Produto AliExpress: {title}. Preço R$ {sale}",
-            "telegram_text": f"🔥 <b>{title}</b>\n\n💰 R$ {sale} (-{disc}%)\n⭐ {rate}\n\n<a href='{aff_tg}'>Comprar</a>",
+            "telegram_text": capped,
+            "buffer_text": capped,
             "aff_url_pin": aff_pin, "aff_url_tg": aff_tg, "image_url": img, "product": product,
         }
 
@@ -194,9 +244,9 @@ def generate_content(product, keyword):
 Produto: {title}
 Preco: R$ {sale} (era R$ {orig}, -{disc}%)
 Avaliacao: {rate} | Keyword: {keyword}
-Link Pinterest: {aff_pin} | Link Telegram: {aff_tg}
+Link Pinterest: {aff_pin} | Link Telegram/Buffer: {aff_tg}
 JSON SOMENTE:
-{{"pinterest_title":"titulo Pin SEO max 95 chars keyword+beneficio+preco","pinterest_description":"descricao Pin 450 chars PT emojis beneficios urgencia CTA 8 hashtags #achadinhos #aliexpress #oferta #desconto #brasil #comprasonline #fretegratis #promocao","pinterest_alt_text":"alt text SEO descritivo max 300 chars","telegram_text":"mensagem HTML max 800 chars emoji <b>titulo</b> preco desconto 3 beneficios CTA link"}}"""
+{{"pinterest_title":"titulo Pin SEO max 95 chars keyword+beneficio+preco","pinterest_description":"descricao Pin 450 chars PT emojis beneficios urgencia CTA 8 hashtags #achadinhos #aliexpress #oferta #desconto #brasil #comprasonline #fretegratis #promocao","pinterest_alt_text":"alt text SEO descritivo max 300 chars","telegram_text":"mensagem CURTA max 250 caracteres TOTAL (incluindo link e hashtags) — emoji + preco + desconto + link + 2-3 hashtags trending Brasil (ex: #achadinhos #aliexpress #promocao)","buffer_text":"mesma regra do telegram_text: max 250 caracteres TOTAL, otimizado para X/Twitter, com hashtags trending Brasil"}}"""
 
     try:
         resp = http_post(
@@ -208,15 +258,21 @@ JSON SOMENTE:
         text = next((b["text"] for b in resp.get("content",[]) if b.get("type")=="text"), "")
         content = json.loads(text.replace("```json","").replace("```","").strip())
         content.update({"aff_url_pin":aff_pin,"aff_url_tg":aff_tg,"image_url":img,"product":product})
+        # حماية إضافية: Claude ممكن يتعدى الحد رغم التعليمات، فنقصو يدويًا
+        for key in ("telegram_text", "buffer_text"):
+            if len(content.get(key, "")) > POST_CHAR_LIMIT:
+                content[key] = build_capped_post(title, sale, disc, aff_tg, POST_CHAR_LIMIT, day_offset)
         add_log(f"Claude OK: {title[:35]}...", "ok")
         return content
     except Exception as e:
         add_log(f"Claude erro: {e}", "warn")
+        capped = build_capped_post(title, sale, disc, aff_tg, POST_CHAR_LIMIT, day_offset)
         return {
             "pinterest_title": f"{title[:80]} — R$ {sale} (-{disc}%)",
             "pinterest_description": f"Achado! {title} por R$ {sale}\n#achadinhos #aliexpress #oferta #brasil",
             "pinterest_alt_text": f"Produto AliExpress: {title}",
-            "telegram_text": f"🔥 <b>{title}</b>\n\n💰 R$ {sale} (-{disc}%)\n⭐ {rate}\n\n<a href='{aff_tg}'>Comprar</a>",
+            "telegram_text": capped,
+            "buffer_text": capped,
             "aff_url_pin":aff_pin,"aff_url_tg":aff_tg,"image_url":img,"product":product,
         }
 
@@ -259,6 +315,10 @@ def publish_telegram(content):
             "category": "electronics",
         }
         caption = build_telegram_message(ali_product, template_type="auto")
+        # القالب الخارجي (telegram_templates.py) ماشي مضمون يحترم حد الـ 250 حرف،
+        # فكنرجعو للنص الجاهز المحدود مسبقًا إلا تعدى الحد (باش الرابط ما يتقطعش).
+        if len(caption) > POST_CHAR_LIMIT:
+            caption = content.get("telegram_text") or caption[:POST_CHAR_LIMIT]
         try:
             resp = http_post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
@@ -266,9 +326,12 @@ def publish_telegram(content):
                  "caption":caption,"parse_mode":"HTML"}
             )
         except Exception:
+            fallback_text = content.get("telegram_text", "")
+            if len(fallback_text) > POST_CHAR_LIMIT:
+                fallback_text = fallback_text[:POST_CHAR_LIMIT]
             resp = http_post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                {"chat_id":TG_CHANNEL,"text":content["telegram_text"],
+                {"chat_id":TG_CHANNEL,"text":fallback_text,
                  "parse_mode":"HTML","disable_web_page_preview":False}
             )
         if resp.get("ok"):
@@ -432,12 +495,9 @@ def publish_buffer(content, keyword):
         img     = content.get("image_url", "")
         rate    = product.get("evaluate_rate", "95%")
 
-        text = (
-            f"Achado incrivel!\n\n{title}\n\n"
-            f"R$ {sale} (-{disc}%)\nAvaliacao: {rate}\n\n"
-            f"Compre aqui: {aff_url}\n\n"
-            "#achadinhos #aliexpress #oferta #desconto #brasil #comprasonline"
-        )
+        text = content.get("buffer_text") or f"{title}\nR$ {sale} (-{disc}%)\n{aff_url}"
+        if len(text) > POST_CHAR_LIMIT:
+            text = text[:POST_CHAR_LIMIT]
 
         mutation = """
         mutation CreatePost($input: CreatePostInput!) {
