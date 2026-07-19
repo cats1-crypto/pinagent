@@ -34,10 +34,11 @@ TRENDING_HASHTAGS_BR = [
     "#viral", "#brasil", "#fretegratis", "#achadinhosaliexpress",
 ]
 
-def pick_trending_hashtags(budget_chars, day_offset=0):
+def pick_trending_hashtags(budget_chars, day_offset=0, max_count=3):
     """
-    كتختار هاشتاغات ترند فـ البرازيل بقدر المساحة المتاحة (budget_chars) بلا
-    ما تتعداها. day_offset كيبدل نقطة البداية فـ القائمة باش تتنوع المنشورات.
+    كتختار هاشتاغات ترند فـ البرازيل بقدر المساحة المتاحة (budget_chars)، بحد
+    أقصى max_count هاشتاغ (الشكل المطلوب: 3). day_offset كيبدل نقطة البداية
+    فـ القائمة باش تتنوع المنشورات يوميًا.
     """
     if budget_chars <= 0:
         return ""
@@ -45,6 +46,8 @@ def pick_trending_hashtags(budget_chars, day_offset=0):
     rotated = TRENDING_HASHTAGS_BR[day_offset % n:] + TRENDING_HASHTAGS_BR[:day_offset % n]
     chosen, used = [], 0
     for tag in rotated:
+        if len(chosen) >= max_count:
+            break
         add_len = len(tag) + (1 if chosen else 0)
         if used + add_len > budget_chars:
             continue
@@ -52,23 +55,60 @@ def pick_trending_hashtags(budget_chars, day_offset=0):
         used += add_len
     return " ".join(chosen)
 
-def build_capped_post(title, sale, disc, aff_url, max_len=POST_CHAR_LIMIT, day_offset=0):
+# إيموجي حسب فئة المنتج (كيلي "keyword" ديال اليوم)
+CATEGORY_EMOJIS = {
+    "fone": "🎧", "bluetooth": "🎧", "smartwatch": "⌚", "cabo": "🔌",
+    "case": "📱", "led": "💡", "organizador": "🗄️", "brinquedo": "🧸",
+}
+
+def pick_emoji(keyword):
+    kw = (keyword or "").lower()
+    for k, e in CATEGORY_EMOJIS.items():
+        if k in kw:
+            return e
+    return "🔥"
+
+def fmt_brl(value):
+    """كيهيّئ رقم بصيغة برازيلية: فاصلة بدل نقطة، وبلا ,00 إلا كان رقم صحيح."""
+    v = float(value)
+    if v == int(v):
+        return f"{int(v)}"
+    return f"{v:.2f}".replace(".", ",")
+
+def build_capped_post(title, sale, orig, disc, aff_url, keyword="", max_len=POST_CHAR_LIMIT, day_offset=0):
     """
-    كتبني منشور مختصر (Telegram أو Buffer/X) ما كيتعداش max_len حرف، بما فيه
-    السعر والرابط وهاشتاغات ترند فـ البرازيل. العنوان كيتقلص أولاً إلا خص المكان.
+    كتبني المنشور بالشكل المطلوب بالضبط:
+    🎧 Title por R$X,XX (era R$Y!) — Z% OFF 🔥
+    👉 aff_url
+    🔥Convide seus amigos 🔥
+    https://t.me/canal
+    #hashtag1 #hashtag2 #hashtag3
+    ما كيتعداش max_len حرف؛ العنوان هو الوحيد اللي كيتقلص إلا خص المكان،
+    باقي الأسطر (الرابط، دعوة الأصدقاء، رابط القناة) ثابتة ديمًا.
     """
-    price_line = f"🔥 R$ {sale} (-{disc}%)"
-    cta = f"👉 {aff_url}"
-    # مساحة محجوزة للسعر + الرابط + الأسطر الفارغة بينهم
-    reserved = len(price_line) + len(cta) + 2
-    title_budget = max(15, max_len - reserved - 30)  # ~30 حرف محجوزين للهاشتاغات
+    emoji = pick_emoji(keyword)
+    sale_fmt = fmt_brl(sale)
+    orig_fmt = fmt_brl(orig)
+    tg_channel_link = f"https://t.me/{TG_CHANNEL.replace('@','')}"
+    suffix = f" por R${sale_fmt} (era R${orig_fmt}!) — {disc}% OFF 🔥"
+    tail = f"\n👉 {aff_url}\n🔥Convide seus amigos 🔥\n{tg_channel_link}"
+
+    def assemble(t, hashtags):
+        post = f"{emoji} {t}{suffix}{tail}"
+        if hashtags:
+            post += f"\n{hashtags}"
+        return post
+
+    # نحسبو أولاً المساحة المتوفرة للهاشتاغات بافتراض عنوان فارغ
+    remaining_for_title_and_tags = max_len - len(assemble("", ""))
+    hashtags_budget = max(0, remaining_for_title_and_tags // 3)
+    hashtags = pick_trending_hashtags(hashtags_budget, day_offset, max_count=3)
+
+    used_by_fixed = len(assemble("", hashtags))
+    title_budget = max(10, max_len - used_by_fixed)
     short_title = title if len(title) <= title_budget else title[:max(0, title_budget - 1)].rstrip() + "…"
 
-    body = f"{price_line}\n{short_title}\n{cta}"
-    remaining = max_len - len(body) - 1  # -1 للسطر الفارغ قبل الهاشتاغات
-    hashtags = pick_trending_hashtags(remaining, day_offset)
-    post = body + (f"\n{hashtags}" if hashtags else "")
-    return post[:max_len]
+    return assemble(short_title, hashtags)[:max_len]
 
 PEAK = {
     0: ["09:00","12:00","20:00","21:00"],
@@ -92,6 +132,7 @@ DAYS = ["Dom","Seg","Ter","Qua","Qui","Sex","Sab"]
 
 logs = []
 stats = {"today": 0, "total": 0, "last_run": None}
+fired_slots = set()  # مشتركة بين scheduler() الداخلي و/api/cron-check باش ما ينشرش مرتين لنفس الوقت
 
 def get_brt():
     return datetime.now(timezone(timedelta(hours=-3)))
@@ -228,9 +269,9 @@ def generate_content(product, keyword):
         add_log(f"⚠️ Link de afiliado NÃO gerado para {pid} — usando link normal (sem tracking)", "warn")
 
     day_offset = get_brt().timetuple().tm_yday  # كيبدل الهاشتاغات كل يوم
+    capped = build_capped_post(title, sale, orig, disc, aff_tg, keyword, POST_CHAR_LIMIT, day_offset)
 
     if not ANTHROPIC_KEY:
-        capped = build_capped_post(title, sale, disc, aff_tg, POST_CHAR_LIMIT, day_offset)
         return {
             "pinterest_title": f"{title[:80]} — R$ {sale} (-{disc}%)",
             "pinterest_description": f"Achado incrível! {title} por R$ {sale}\n#achadinhos #aliexpress #oferta #desconto #brasil",
@@ -244,29 +285,27 @@ def generate_content(product, keyword):
 Produto: {title}
 Preco: R$ {sale} (era R$ {orig}, -{disc}%)
 Avaliacao: {rate} | Keyword: {keyword}
-Link Pinterest: {aff_pin} | Link Telegram/Buffer: {aff_tg}
-JSON SOMENTE:
-{{"pinterest_title":"titulo Pin SEO max 95 chars keyword+beneficio+preco","pinterest_description":"descricao Pin 450 chars PT emojis beneficios urgencia CTA 8 hashtags #achadinhos #aliexpress #oferta #desconto #brasil #comprasonline #fretegratis #promocao","pinterest_alt_text":"alt text SEO descritivo max 300 chars","telegram_text":"mensagem CURTA max 250 caracteres TOTAL (incluindo link e hashtags) — emoji + preco + desconto + link + 2-3 hashtags trending Brasil (ex: #achadinhos #aliexpress #promocao)","buffer_text":"mesma regra do telegram_text: max 250 caracteres TOTAL, otimizado para X/Twitter, com hashtags trending Brasil"}}"""
+Link Pinterest: {aff_pin}
+JSON SOMENTE (apenas conteudo do Pinterest — telegram/buffer sao gerados por template fixo):
+{{"pinterest_title":"titulo Pin SEO max 95 chars keyword+beneficio+preco","pinterest_description":"descricao Pin 450 chars PT emojis beneficios urgencia CTA 8 hashtags #achadinhos #aliexpress #oferta #desconto #brasil #comprasonline #fretegratis #promocao","pinterest_alt_text":"alt text SEO descritivo max 300 chars"}}"""
 
     try:
         resp = http_post(
             "https://api.anthropic.com/v1/messages",
-            {"model":"claude-sonnet-4-6","max_tokens":800,
+            {"model":"claude-sonnet-4-6","max_tokens":500,
              "messages":[{"role":"user","content":prompt}]},
             {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"}
         )
         text = next((b["text"] for b in resp.get("content",[]) if b.get("type")=="text"), "")
         content = json.loads(text.replace("```json","").replace("```","").strip())
-        content.update({"aff_url_pin":aff_pin,"aff_url_tg":aff_tg,"image_url":img,"product":product})
-        # حماية إضافية: Claude ممكن يتعدى الحد رغم التعليمات، فنقصو يدويًا
-        for key in ("telegram_text", "buffer_text"):
-            if len(content.get(key, "")) > POST_CHAR_LIMIT:
-                content[key] = build_capped_post(title, sale, disc, aff_tg, POST_CHAR_LIMIT, day_offset)
+        content.update({
+            "aff_url_pin": aff_pin, "aff_url_tg": aff_tg, "image_url": img, "product": product,
+            "telegram_text": capped, "buffer_text": capped,
+        })
         add_log(f"Claude OK: {title[:35]}...", "ok")
         return content
     except Exception as e:
         add_log(f"Claude erro: {e}", "warn")
-        capped = build_capped_post(title, sale, disc, aff_tg, POST_CHAR_LIMIT, day_offset)
         return {
             "pinterest_title": f"{title[:80]} — R$ {sale} (-{disc}%)",
             "pinterest_description": f"Achado! {title} por R$ {sale}\n#achadinhos #aliexpress #oferta #brasil",
@@ -495,7 +534,7 @@ def publish_buffer(content, keyword):
         img     = content.get("image_url", "")
         rate    = product.get("evaluate_rate", "95%")
 
-        text = content.get("buffer_text") or f"{title}\nR$ {sale} (-{disc}%)\n{aff_url}"
+        text = content.get("buffer_text") or build_capped_post(title, sale, orig, disc, aff_url, keyword, POST_CHAR_LIMIT)
         if len(text) > POST_CHAR_LIMIT:
             text = text[:POST_CHAR_LIMIT]
 
@@ -572,20 +611,19 @@ def run_pipeline(manual=False):
     return results
 
 def scheduler():
-    fired = set()
     while True:
         try:
             brt = get_brt()
             hhmm = brt.strftime("%H:%M")
             day  = (brt.weekday() + 1) % 7
             key  = f"{day}-{hhmm}"
-            if hhmm in PEAK.get(day, []) and key not in fired:
-                fired.add(key)
-                add_log(f"Pico: {hhmm} BRT — publicando!", "ok")
+            if hhmm in PEAK.get(day, []) and key not in fired_slots:
+                fired_slots.add(key)
+                add_log(f"Pico: {hhmm} BRT — publicando! (scheduler interno)", "ok")
                 run_pipeline()
-            # Clear fired keys every hour
-            if brt.minute == 0 and brt.second < 30:
-                fired.clear()
+            # كنمسحو الـ set كل يوم فمنتصف الليل باش ما يكبرش بلا حدود
+            if brt.hour == 0 and brt.minute == 0:
+                fired_slots.clear()
         except Exception as e:
             add_log(f"Scheduler: {e}", "err")
         time.sleep(30)
@@ -1014,6 +1052,26 @@ def index():
 @app.route("/ping")
 def ping():
     return jsonify({"status":"ok","service":"PinAgent Cloud"})
+
+@app.route("/api/cron-check")
+def api_cron_check():
+    """
+    مخصص لخدمة ping خارجية (cron-job.org, UptimeRobot...) تناديه كل 5 دقايق.
+    الهدف: توقظ الخدمة (Render free يرقد بعد 15 دقيقة بلا زيارات) وتتأكد واش
+    دابا وقت ذروة بالضبط — إلا كان، كتنشر مباشرة بلا ما تحتاج أي جهاز مشغل
+    عند Aliexe. آمنة تتنادى بزاف؛ ماكتنشرش مرتين لنفس الوقت (fired_slots مشتركة
+    مع الـ scheduler الداخلي).
+    """
+    brt = get_brt()
+    hhmm = brt.strftime("%H:%M")
+    day  = (brt.weekday() + 1) % 7
+    key  = f"{day}-{hhmm}"
+    if hhmm in PEAK.get(day, []) and key not in fired_slots:
+        fired_slots.add(key)
+        add_log(f"Pico: {hhmm} BRT — publicando! (cron externo)", "ok")
+        results = run_pipeline()
+        return jsonify({"ran": True, "brt_time": hhmm, "results": results})
+    return jsonify({"ran": False, "brt_time": hhmm, "is_peak": hhmm in PEAK.get(day, [])})
 
 @app.route("/api/run", methods=["POST"])
 def api_run():
