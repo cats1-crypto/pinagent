@@ -1,4 +1,4 @@
-import os, json, hashlib, urllib.parse, urllib.request, ssl, threading, time
+import os, json, hmac, hashlib, urllib.parse, urllib.request, ssl, threading, time
 from flask import Flask, jsonify, request
 from telegram_templates import build_telegram_message
 from datetime import datetime, timezone, timedelta
@@ -20,7 +20,9 @@ BLOGGER_CLIENT  = os.environ.get("BLOGGER_CLIENT_ID", "")
 BLOGGER_SECRET  = os.environ.get("BLOGGER_CLIENT_SECRET", "")
 BLOGGER_BLOG_ID = os.environ.get("BLOGGER_BLOG_ID", "2781402232561095495")
 BUFFER_TOKEN    = os.environ.get("BUFFER_TOKEN", "")
-BUFFER_PROFILES = os.environ.get("BUFFER_PROFILES", "")  # comma-separated profile IDs
+BUFFER_PROFILES = os.environ.get("BUFFER_PROFILES", "")  # comma-separated Buffer channel IDs
+
+BUFFER_API_URL = "https://api.buffer.com"
 
 PEAK = {
     0: ["09:00","12:00","20:00","21:00"],
@@ -67,8 +69,16 @@ def http_post(url, body, headers=None):
         return json.loads(r.read())
 
 def ali_sign(params, secret):
-    s = "".join(f"{k}{params[k]}" for k in sorted(params))
-    return hashlib.md5(f"{secret}{s}{secret}".encode()).hexdigest().upper()
+    """
+    توقيع HMAC-SHA256 المطلوب من AliExpress Open Platform لـ endpoint /sync (v2).
+    نفس الطريقة المستعملة فـ bot.py (Termux) — بلا "wrap" بالـ secret فالبداية/النهاية
+    (تلك كانت صيغة MD5 القديمة لـ TOP Gateway وما كتخدمش مع sign_method=sha256).
+    """
+    sorted_params = sorted(params.items())
+    base_string = "".join(f"{k}{v}" for k, v in sorted_params)
+    return hmac.new(
+        secret.encode("utf-8"), base_string.encode("utf-8"), hashlib.sha256
+    ).hexdigest().upper()
 
 def mock_products(kw, n=2):
     return [
@@ -85,13 +95,20 @@ def fetch_products(keyword, n=2):
         add_log("Demo mode — sem credenciais AliExpress", "warn")
         return mock_products(keyword, n)
     try:
-        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         params = {
-            "app_key": ALI_KEY, "timestamp": ts, "sign_method": "md5",
+            "app_key": ALI_KEY,
             "method": "aliexpress.affiliate.product.query",
-            "keywords": keyword, "target_currency": "BRL",
-            "target_language": "PT", "tracking_id": ALI_TRACKING,
-            "page_no": "1", "page_size": str(n), "country": "BR",
+            "sign_method": "sha256",
+            "timestamp": str(int(time.time() * 1000)),
+            "format": "json",
+            "v": "2.0",
+            "keywords": keyword,
+            "target_currency": "BRL",
+            "target_language": "PT",
+            "tracking_id": ALI_TRACKING,
+            "page_no": "1",
+            "page_size": str(n),
+            "country": "BR",
         }
         params["sign"] = ali_sign(params, ALI_SECRET)
         url = "https://api-sg.aliexpress.com/sync?" + urllib.parse.urlencode(params)
@@ -103,6 +120,8 @@ def fetch_products(keyword, n=2):
         if items:
             add_log(f"AliExpress: {len(items)} produto(s)", "ok")
             return items[:n]
+        else:
+            add_log(f"AliExpress: resposta vazia — {data}", "warn")
     except Exception as e:
         add_log(f"AliExpress erro: {e}", "warn")
     return mock_products(keyword, n)
@@ -311,22 +330,54 @@ def publish_blogger(content, keyword):
         return {"ok":False,"ch":"blogger","error":err}
 
 
+def _buffer_graphql(query, variables=None):
+    """
+    استدعاء عام لـ Buffer GraphQL API (endpoint واحد: https://api.buffer.com).
+    كتستعمل Bearer token، وكترجع الـ 'data' أو كترمي Exception إلا كاين errors.
+    """
+    body = {"query": query}
+    if variables:
+        body["variables"] = variables
+    resp = http_post(BUFFER_API_URL, body, {"Authorization": f"Bearer {BUFFER_TOKEN}"})
+    if resp.get("errors"):
+        raise Exception(resp["errors"][0].get("message", "Buffer GraphQL error"))
+    return resp.get("data", {})
+
+def _buffer_get_channel_ids():
+    """كيجيب channel IDs ديال أول organization متاحة، كيستثني القنوات المفصولة."""
+    data = _buffer_graphql("query { account { organizations { id } } }")
+    orgs = (data.get("account") or {}).get("organizations", [])
+    if not orgs:
+        return []
+    org_id = orgs[0]["id"]
+    query = """
+    query GetChannels($orgId: OrganizationId!) {
+      channels(input: {organizationId: $orgId}) {
+        id
+        service
+        isDisconnected
+      }
+    }
+    """
+    data = _buffer_graphql(query, {"orgId": org_id})
+    channels = data.get("channels", []) or []
+    return [c["id"] for c in channels if not c.get("isDisconnected")]
+
 def publish_buffer(content, keyword):
-    """Publish to Buffer — schedules posts for Facebook, Instagram, Twitter."""
+    """
+    ينشر مباشرة (shareNow) عبر Buffer GraphQL API الحالي (createPost mutation).
+    الـ REST القديم (api.bufferapp.com/1/...) متوقف ومكانش كيخدم.
+    BUFFER_PROFILES (اختياري): channel IDs مفصولة بفاصلة. إلا فارغة، كتجيب
+    القنوات المتصلة تلقائيًا من الـ organization الأولى.
+    """
     if not BUFFER_TOKEN:
         return {"ok": False, "simulated": True, "ch": "buffer"}
     try:
-        profile_ids = [p.strip() for p in BUFFER_PROFILES.split(",") if p.strip()]
-        if not profile_ids:
-            # Auto-fetch profile IDs
-            req = urllib.request.Request("https://api.bufferapp.com/1/profiles.json")
-            req.add_header("Authorization", f"Bearer {BUFFER_TOKEN}")
-            with urllib.request.urlopen(req, context=ctx, timeout=15) as r:
-                profiles = json.loads(r.read())
-            profile_ids = [p["id"] for p in profiles if p.get("id")]
-
-        if not profile_ids:
-            return {"ok": False, "ch": "buffer", "error": "No profiles found"}
+        channel_ids = [c.strip() for c in BUFFER_PROFILES.split(",") if c.strip()]
+        if not channel_ids:
+            channel_ids = _buffer_get_channel_ids()
+        if not channel_ids:
+            return {"ok": False, "ch": "buffer", "error": "No channels found"}
 
         product = content.get("product", {})
         title   = product.get("product_title", "")
@@ -335,44 +386,58 @@ def publish_buffer(content, keyword):
         disc    = round((1-float(sale)/float(orig))*100) if float(orig)>0 else 0
         aff_url = content.get("aff_url_pin", "")
         img     = content.get("image_url", "")
+        rate    = product.get("evaluate_rate", "95%")
 
-        rate = product.get("evaluate_rate", "95%")
-        lines_text = [
-            "Achado incrivel!",
-            "",
-            str(title),
-            "",
-            "R$ " + str(sale) + " (-" + str(disc) + "%)",
-            "Avaliacao: " + rate,
-            "",
-            "Compre aqui: " + str(aff_url),
-            "",
+        text = (
+            f"Achado incrivel!\n\n{title}\n\n"
+            f"R$ {sale} (-{disc}%)\nAvaliacao: {rate}\n\n"
+            f"Compre aqui: {aff_url}\n\n"
             "#achadinhos #aliexpress #oferta #desconto #brasil #comprasonline"
-        ]
-        text = "\n".join(lines_text)
+        )
+
+        mutation = """
+        mutation CreatePost($input: CreatePostInput!) {
+          createPost(input: $input) {
+            ... on PostActionSuccess { post { id status } }
+            ... on InvalidInputError { message }
+            ... on UnauthorizedError { message }
+            ... on UnexpectedError { message }
+            ... on RestProxyError { message }
+            ... on LimitReachedError { message }
+            ... on NotFoundError { message }
+          }
+        }
+        """
 
         results = []
-        for pid in profile_ids[:3]:  # max 3 profiles
+        for cid in channel_ids[:3]:  # حد أقصى 3 قنوات فـ كل دفعة
             try:
-                resp = http_post(
-                    "https://api.bufferapp.com/1/updates/create.json",
-                    {"text": text,
-                     "profile_ids[]": pid,
-                     "media[link]": aff_url,
-                     "media[picture]": img,
-                     "media[title]": title[:100],
-                     "now": True},
-                    {"Authorization": f"Bearer {BUFFER_TOKEN}"}
-                )
-                if resp.get("success"):
-                    results.append(pid)
+                assets = []
+                if img:
+                    assets = [{"image": {"url": img, "metadata": {"altText": (title[:100] or "AliExpress product")}}}]
+                variables = {
+                    "input": {
+                        "channelId": cid,
+                        "schedulingType": "automatic",
+                        "mode": "shareNow",
+                        "text": text,
+                        "assets": assets,
+                        "source": "PinAgentCloud",
+                    }
+                }
+                data = _buffer_graphql(mutation, variables)
+                payload = data.get("createPost", {}) or {}
+                if payload.get("post"):
+                    results.append(cid)
+                else:
+                    add_log(f"Buffer canal {cid}: {payload.get('message','erro desconhecido')}", "warn")
             except Exception as e:
-                add_log(f"Buffer profile {pid}: {e}", "warn")
+                add_log(f"Buffer canal {cid}: {e}", "warn")
 
         if results:
-            add_log(f"Buffer: {len(results)} perfil(s) publicado(s)", "ok")
+            add_log(f"Buffer: {len(results)} canal(is) publicado(s)", "ok")
             return {"ok": True, "ch": "buffer", "profiles": len(results)}
-        return {"ok": False, "ch": "buffer", "error": "All profiles failed"}
+        return {"ok": False, "ch": "buffer", "error": "All channels failed"}
     except Exception as e:
         add_log(f"Buffer erro: {e}", "err")
         return {"ok": False, "ch": "buffer", "error": str(e)}
@@ -620,6 +685,8 @@ html,body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMa
           <div>PIN_BOARD_ID <span style="color:var(--yw)">← ID do seu board</span></div>
           <div>TG_TOKEN <span style="color:var(--yw)">← @BotFather</span></div>
           <div>TG_CHANNEL <span style="color:var(--tx)">= @Ofertassdiariasaliexpresss</span></div>
+          <div>BUFFER_TOKEN <span style="color:var(--yw)">← Buffer Dashboard → API</span></div>
+          <div>BUFFER_PROFILES <span style="color:var(--tx)">(opcional, channel IDs separados por vírgula)</span></div>
         </div>
       </div>
     </div>
