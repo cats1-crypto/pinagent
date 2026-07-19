@@ -80,6 +80,45 @@ def ali_sign(params, secret):
         secret.encode("utf-8"), base_string.encode("utf-8"), hashlib.sha256
     ).hexdigest().upper()
 
+def generate_affiliate_link(product_url, promotion_link_type="2"):
+    """
+    كتستدعي aliexpress.affiliate.link.generate الحقيقي وترجع رابط أفلييت
+    حقيقي (بتتبع + خصم عملات على الموبايل). كترجع None إلا فشلت أو
+    الـ credentials ناقصين، باش الكود اللي كيناديها يقدر يرجع لرابط عادي.
+    """
+    if not ALI_KEY or not ALI_SECRET:
+        return None
+    try:
+        params = {
+            "app_key": ALI_KEY,
+            "method": "aliexpress.affiliate.link.generate",
+            "sign_method": "sha256",
+            "timestamp": str(int(time.time() * 1000)),
+            "format": "json",
+            "v": "2.0",
+            "promotion_link_type": promotion_link_type,
+            "source_values": product_url,
+            "tracking_id": ALI_TRACKING,
+        }
+        params["sign"] = ali_sign(params, ALI_SECRET)
+        url = "https://api-sg.aliexpress.com/sync?" + urllib.parse.urlencode(params)
+        with urllib.request.urlopen(url, context=ctx, timeout=15) as r:
+            data = json.loads(r.read())
+        promo_links = (
+            data.get("aliexpress_affiliate_link_generate_response", {})
+            .get("resp_result", {})
+            .get("result", {})
+            .get("promotion_links", {})
+            .get("promotion_link", [])
+        )
+        if promo_links:
+            return promo_links[0]["promotion_link"]
+        add_log(f"Link generate vazio (type={promotion_link_type}): {data}", "warn")
+    except Exception as e:
+        add_log(f"Link generate erro: {e}", "warn")
+    return None
+
+
 def mock_products(kw, n=2):
     return [
         {"product_id":"1005001","product_title":f"Fone Bluetooth 5.3 TWS {kw}",
@@ -134,8 +173,13 @@ def generate_content(product, keyword):
     disc  = round((1 - sale/orig)*100) if orig > 0 else 0
     rate  = product.get("evaluate_rate","95%")
     img   = product.get("product_main_image_url","")
-    aff_pin = f"https://www.aliexpress.com/item/{pid}.html?aff_fcid={ALI_TRACKING}&sk=pinterest"
-    aff_tg  = f"https://www.aliexpress.com/item/{pid}.html?aff_fcid={ALI_TRACKING}&sk=telegram"
+    raw_url = f"https://www.aliexpress.com/item/{pid}.html"
+    # promotion_link_type=2: رابط "hot product" — كيفعّل خصم العملات فـ التطبيق (موبايل)
+    # promotion_link_type=0: رابط عام — كيخدم مزيان فـ المتصفح/PC
+    aff_pin = generate_affiliate_link(raw_url, "2") or raw_url
+    aff_tg  = generate_affiliate_link(raw_url, "0") or raw_url
+    if aff_pin == raw_url:
+        add_log(f"⚠️ Link de afiliado NÃO gerado para {pid} — usando link normal (sem tracking)", "warn")
 
     if not ANTHROPIC_KEY:
         return {
