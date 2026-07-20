@@ -167,6 +167,30 @@ def ali_sign(params, secret):
         secret.encode("utf-8"), base_string.encode("utf-8"), hashlib.sha256
     ).hexdigest().upper()
 
+def _ali_api_call(params_builder, timeout=15, max_retries=3):
+    """
+    كتنادي AliExpress API مع إعادة محاولة تلقائية إلا كان الخطأ ApiCallLimit
+    (rate limit مؤقت، عادة كيدوم ثانية وحدة). كترجع الـ dict ديال JSON response.
+    params_builder: دالة بلا معطيات كترجع dict ديال params جاهز (بلا "sign")،
+    باش كل محاولة تبني timestamp وsign جداد (الـ signature مرتبطة بالـ timestamp).
+    """
+    last_data = None
+    for attempt in range(max_retries):
+        params = params_builder()
+        params["sign"] = ali_sign(params, ALI_SECRET)
+        url = "https://api-sg.aliexpress.com/sync?" + urllib.parse.urlencode(params)
+        with urllib.request.urlopen(url, context=ctx, timeout=timeout) as r:
+            data = json.loads(r.read())
+        last_data = data
+        err = data.get("error_response", {})
+        if err.get("code") == "ApiCallLimit" and attempt < max_retries - 1:
+            add_log(f"AliExpress rate limit — retry {attempt+1}/{max_retries} em 2s...", "warn")
+            time.sleep(2)
+            continue
+        return data
+    return last_data
+
+
 def generate_affiliate_link(product_url, promotion_link_type="2"):
     """
     كتستدعي aliexpress.affiliate.link.generate الحقيقي وترجع رابط أفلييت
@@ -176,21 +200,22 @@ def generate_affiliate_link(product_url, promotion_link_type="2"):
     if not ALI_KEY or not ALI_SECRET:
         return None
     try:
-        params = {
-            "app_key": ALI_KEY,
-            "method": "aliexpress.affiliate.link.generate",
-            "sign_method": "sha256",
-            "timestamp": str(int(time.time() * 1000)),
-            "format": "json",
-            "v": "2.0",
-            "promotion_link_type": promotion_link_type,
-            "source_values": product_url,
-            "tracking_id": ALI_TRACKING,
-        }
-        params["sign"] = ali_sign(params, ALI_SECRET)
-        url = "https://api-sg.aliexpress.com/sync?" + urllib.parse.urlencode(params)
-        with urllib.request.urlopen(url, context=ctx, timeout=15) as r:
-            data = json.loads(r.read())
+        def build_params():
+            return {
+                "app_key": ALI_KEY,
+                "method": "aliexpress.affiliate.link.generate",
+                "sign_method": "sha256",
+                "timestamp": str(int(time.time() * 1000)),
+                "format": "json",
+                "v": "2.0",
+                "promotion_link_type": promotion_link_type,
+                "source_values": product_url,
+                "tracking_id": ALI_TRACKING,
+            }
+        data = _ali_api_call(build_params)
+        if data.get("error_response"):
+            add_log(f"Link generate erro API: {data['error_response'].get('msg')}", "warn")
+            return None
         promo_links = (
             data.get("aliexpress_affiliate_link_generate_response", {})
             .get("resp_result", {})
@@ -198,8 +223,12 @@ def generate_affiliate_link(product_url, promotion_link_type="2"):
             .get("promotion_links", {})
             .get("promotion_link", [])
         )
-        if promo_links:
-            return promo_links[0]["promotion_link"]
+        for item in promo_links:
+            # الأمان: بعض الردود ممكن يكون شكلها مختلف (string بدل dict)
+            if isinstance(item, dict) and item.get("promotion_link"):
+                return item["promotion_link"]
+            if isinstance(item, str) and item:
+                return item
         add_log(f"Link generate vazio (type={promotion_link_type}): {data}", "warn")
     except Exception as e:
         add_log(f"Link generate erro: {e}", "warn")
@@ -221,25 +250,23 @@ def fetch_products(keyword, n=2):
         add_log("Demo mode — sem credenciais AliExpress", "warn")
         return mock_products(keyword, n)
     try:
-        params = {
-            "app_key": ALI_KEY,
-            "method": "aliexpress.affiliate.product.query",
-            "sign_method": "sha256",
-            "timestamp": str(int(time.time() * 1000)),
-            "format": "json",
-            "v": "2.0",
-            "keywords": keyword,
-            "target_currency": "BRL",
-            "target_language": "PT",
-            "tracking_id": ALI_TRACKING,
-            "page_no": "1",
-            "page_size": str(n),
-            "country": "BR",
-        }
-        params["sign"] = ali_sign(params, ALI_SECRET)
-        url = "https://api-sg.aliexpress.com/sync?" + urllib.parse.urlencode(params)
-        with urllib.request.urlopen(url, context=ctx, timeout=30) as r:
-            data = json.loads(r.read())
+        def build_params():
+            return {
+                "app_key": ALI_KEY,
+                "method": "aliexpress.affiliate.product.query",
+                "sign_method": "sha256",
+                "timestamp": str(int(time.time() * 1000)),
+                "format": "json",
+                "v": "2.0",
+                "keywords": keyword,
+                "target_currency": "BRL",
+                "target_language": "PT",
+                "tracking_id": ALI_TRACKING,
+                "page_no": "1",
+                "page_size": str(n),
+                "country": "BR",
+            }
+        data = _ali_api_call(build_params, timeout=30)
         items = (data.get("aliexpress_affiliate_product_query_response",{})
                      .get("resp_result",{}).get("result",{})
                      .get("products",{}).get("product",[]))
@@ -264,6 +291,7 @@ def generate_content(product, keyword):
     # promotion_link_type=2: رابط "hot product" — كيفعّل خصم العملات فـ التطبيق (موبايل)
     # promotion_link_type=0: رابط عام — كيخدم مزيان فـ المتصفح/PC
     aff_pin = generate_affiliate_link(raw_url, "2") or raw_url
+    time.sleep(1)  # نتفاداو ApiCallLimit بين النداءين المتتاليين
     aff_tg  = generate_affiliate_link(raw_url, "0") or raw_url
     if aff_pin == raw_url:
         add_log(f"⚠️ Link de afiliado NÃO gerado para {pid} — usando link normal (sem tracking)", "warn")
@@ -507,7 +535,7 @@ def _buffer_get_channel_ids():
     """
     data = _buffer_graphql(query, {"orgId": org_id})
     channels = data.get("channels", []) or []
-    return [c["id"] for c in channels if not c.get("isDisconnected")]
+    return [(c["id"], c.get("service","")) for c in channels if not c.get("isDisconnected")]
 
 def publish_buffer(content, keyword):
     """
@@ -519,10 +547,11 @@ def publish_buffer(content, keyword):
     if not BUFFER_TOKEN:
         return {"ok": False, "simulated": True, "ch": "buffer"}
     try:
-        channel_ids = [c.strip() for c in BUFFER_PROFILES.split(",") if c.strip()]
-        if not channel_ids:
-            channel_ids = _buffer_get_channel_ids()
-        if not channel_ids:
+        if BUFFER_PROFILES.strip():
+            channels = [(c.strip(), "") for c in BUFFER_PROFILES.split(",") if c.strip()]
+        else:
+            channels = _buffer_get_channel_ids()
+        if not channels:
             return {"ok": False, "ch": "buffer", "error": "No channels found"}
 
         product = content.get("product", {})
@@ -553,21 +582,23 @@ def publish_buffer(content, keyword):
         """
 
         results = []
-        for cid in channel_ids[:3]:  # حد أقصى 3 قنوات فـ كل دفعة
+        for cid, service in channels[:3]:  # حد أقصى 3 قنوات فـ كل دفعة
             try:
                 assets = []
                 if img:
                     assets = [{"image": {"url": img, "metadata": {"altText": (title[:100] or "AliExpress product")}}}]
-                variables = {
-                    "input": {
-                        "channelId": cid,
-                        "schedulingType": "automatic",
-                        "mode": "shareNow",
-                        "text": text,
-                        "assets": assets,
-                        "source": "PinAgentCloud",
-                    }
+                input_data = {
+                    "channelId": cid,
+                    "schedulingType": "automatic",
+                    "mode": "shareNow",
+                    "text": text,
+                    "assets": assets,
+                    "source": "PinAgentCloud",
                 }
+                # Facebook محتاج نوع المنشور إجباريًا (post/story/reel)
+                if service == "facebook":
+                    input_data["metadata"] = {"facebook": {"type": "post"}}
+                variables = {"input": input_data}
                 data = _buffer_graphql(mutation, variables)
                 payload = data.get("createPost", {}) or {}
                 if payload.get("post"):
