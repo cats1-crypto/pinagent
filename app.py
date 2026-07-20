@@ -133,6 +133,31 @@ DAYS = ["Dom","Seg","Ter","Qua","Qui","Sex","Sab"]
 logs = []
 stats = {"today": 0, "total": 0, "last_run": None}
 fired_slots = set()  # مشتركة بين scheduler() الداخلي و/api/cron-check باش ما ينشرش مرتين لنفس الوقت
+job_state = {"status": "idle", "results": None}  # idle | running | done | error
+
+def run_pipeline_async(manual=True):
+    """
+    كتشغل run_pipeline() فـ Thread منفصل باش أي طلب HTTP (Cron خارجي ولا زر
+    'Publicar agora') يرجع الجواب مباشرة بلا ما ينتظر البايبلاين كامل. هادشي
+    كيتفادى gunicorn worker timeout اللي كان كيقتل السيرفر فـ نص التشغيل.
+    """
+    if job_state["status"] == "running":
+        return False  # كاين ديجا واحد خدام
+    job_state["status"] = "running"
+    job_state["results"] = None
+
+    def _worker():
+        try:
+            results = run_pipeline(manual=manual)
+            job_state["results"] = results
+            job_state["status"] = "done"
+        except Exception as e:
+            add_log(f"Pipeline erro fatal: {e}", "err")
+            job_state["status"] = "error"
+            job_state["results"] = {"error": str(e)}
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return True
 
 def get_brt():
     return datetime.now(timezone(timedelta(hours=-3)))
@@ -250,6 +275,7 @@ def fetch_products(keyword, n=2):
         add_log("Demo mode — sem credenciais AliExpress", "warn")
         return mock_products(keyword, n)
     try:
+        fetch_count = max(n * 5, 20)  # كنجيبو مرشحين أكثر باش الترتيب يكون موثوق
         def build_params():
             return {
                 "app_key": ALI_KEY,
@@ -263,15 +289,24 @@ def fetch_products(keyword, n=2):
                 "target_language": "PT",
                 "tracking_id": ALI_TRACKING,
                 "page_no": "1",
-                "page_size": str(n),
+                "page_size": str(fetch_count),
                 "country": "BR",
+                "sort": "LAST_VOLUME_DESC",  # الأكثر مبيعًا مؤخرًا أولاً
             }
         data = _ali_api_call(build_params, timeout=30)
         items = (data.get("aliexpress_affiliate_product_query_response",{})
                      .get("resp_result",{}).get("result",{})
                      .get("products",{}).get("product",[]))
         if items:
-            add_log(f"AliExpress: {len(items)} produto(s)", "ok")
+            # ترتيب إضافي يدويًا حسب lastest_volume (حجم المبيعات الأخير) —
+            # ضمان إلا كان الـ sort ديال الـ API ما اتاحترمش بالكامل
+            def sales_volume(p):
+                try:
+                    return int(str(p.get("lastest_volume", 0)).replace(",", "") or 0)
+                except (ValueError, TypeError):
+                    return 0
+            items.sort(key=sales_volume, reverse=True)
+            add_log(f"AliExpress: {len(items)} produto(s), top vendas: {sales_volume(items[0])} un.", "ok")
             return items[:n]
         else:
             add_log(f"AliExpress: resposta vazia — {data}", "warn")
@@ -1020,13 +1055,41 @@ function runNow(){
   btn.textContent="⏳ Publicando...";
   addLog("🚀 Publicação manual iniciada...");
   fetch("/api/run",{method:"POST"}).then(function(r){return r.json();}).then(function(data){
-    btn.disabled=false;
-    btn.textContent="📌 Publicar agora";
-    if(data.results) renderResults(data.results);
+    if(data.ok===false){
+      btn.disabled=false;
+      btn.textContent="📌 Publicar agora";
+      addLog("⚠️ "+(data.error||"Não foi possível iniciar"),"warn");
+      return;
+    }
+    pollRunStatus(0);
   }).catch(function(e){
     btn.disabled=false;
     btn.textContent="📌 Publicar agora";
     addLog("❌ Erro: "+e.message,"err");
+  });
+}
+function pollRunStatus(elapsedSec){
+  var btn=document.getElementById("runbtn");
+  if(elapsedSec>=180){ // حد أقصى 3 دقايق انتظار
+    btn.disabled=false;
+    btn.textContent="📌 Publicar agora";
+    addLog("⚠️ A publicação está demorando — verifique os logs no Render","warn");
+    return;
+  }
+  fetch("/api/run-status").then(function(r){return r.json();}).then(function(job){
+    if(job.status==="running"){
+      setTimeout(function(){pollRunStatus(elapsedSec+3);},3000);
+      return;
+    }
+    btn.disabled=false;
+    btn.textContent="📌 Publicar agora";
+    if(job.status==="done" && job.results){
+      renderResults(job.results);
+    }else if(job.status==="error"){
+      addLog("❌ Erro: "+((job.results&&job.results.error)||"erro desconhecido"),"err");
+    }
+  }).catch(function(){
+    setTimeout(function(){pollRunStatus(elapsedSec+3);},3000);
   });
 }
 function renderResults(results){
@@ -1089,9 +1152,10 @@ def api_cron_check():
     """
     مخصص لخدمة ping خارجية (cron-job.org, UptimeRobot...) تناديه كل 5 دقايق.
     الهدف: توقظ الخدمة (Render free يرقد بعد 15 دقيقة بلا زيارات) وتتأكد واش
-    دابا وقت ذروة بالضبط — إلا كان، كتنشر مباشرة بلا ما تحتاج أي جهاز مشغل
-    عند Aliexe. آمنة تتنادى بزاف؛ ماكتنشرش مرتين لنفس الوقت (fired_slots مشتركة
-    مع الـ scheduler الداخلي).
+    دابا وقت ذروة بالضبط — إلا كان، كتنشر فـ الخلفية بلا ما تحتاج أي جهاز
+    مشغل عند Aliexe. آمنة تتنادى بزاف؛ ماكتنشرش مرتين لنفس الوقت (fired_slots
+    مشتركة مع الـ scheduler الداخلي). النشر خدام فـ Thread منفصل باش الطلب
+    يرجع بسرعة ومايتقتلش من gunicorn timeout.
     """
     brt = get_brt()
     hhmm = brt.strftime("%H:%M")
@@ -1100,14 +1164,20 @@ def api_cron_check():
     if hhmm in PEAK.get(day, []) and key not in fired_slots:
         fired_slots.add(key)
         add_log(f"Pico: {hhmm} BRT — publicando! (cron externo)", "ok")
-        results = run_pipeline()
-        return jsonify({"ran": True, "brt_time": hhmm, "results": results})
+        run_pipeline_async(manual=False)
+        return jsonify({"ran": True, "brt_time": hhmm, "started": True})
     return jsonify({"ran": False, "brt_time": hhmm, "is_peak": hhmm in PEAK.get(day, [])})
 
 @app.route("/api/run", methods=["POST"])
 def api_run():
-    results = run_pipeline(manual=True)
-    return jsonify({"ok":True,"results":results})
+    started = run_pipeline_async(manual=True)
+    if not started:
+        return jsonify({"ok": False, "error": "Ja existe uma publicacao em andamento"}), 409
+    return jsonify({"ok": True, "started": True})
+
+@app.route("/api/run-status")
+def api_run_status():
+    return jsonify(job_state)
 
 @app.route("/api/status")
 def api_status():
