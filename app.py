@@ -279,24 +279,39 @@ def fetch_products(keyword, n=2):
         def build_params():
             return {
                 "app_key": ALI_KEY,
-                "method": "aliexpress.affiliate.product.query",
+                # hotproduct.query = endpoint مخصص للمنتجات "الأكثر مبيعًا/رائجة"
+                # (ماشي بحث عادي بالكلمة كيفما product.query)
+                "method": "aliexpress.affiliate.hotproduct.query",
                 "sign_method": "sha256",
                 "timestamp": str(int(time.time() * 1000)),
                 "format": "json",
                 "v": "2.0",
-                "keywords": keyword,
+                "keywords": keyword,  # كنخليو الكلمة كفلتر خفيف باش تتنوع الفئات على مدار الأسبوع
                 "target_currency": "BRL",
                 "target_language": "PT",
                 "tracking_id": ALI_TRACKING,
                 "page_no": "1",
                 "page_size": str(fetch_count),
-                "country": "BR",
+                "ship_to_country": "BR",  # الاسم الصحيح ديال الباراميتر (كان "country" غلط)
                 "sort": "LAST_VOLUME_DESC",  # الأكثر مبيعًا مؤخرًا أولاً
             }
         data = _ali_api_call(build_params, timeout=30)
-        items = (data.get("aliexpress_affiliate_product_query_response",{})
+        items = (data.get("aliexpress_affiliate_hotproduct_query_response",{})
                      .get("resp_result",{}).get("result",{})
                      .get("products",{}).get("product",[]))
+        if not items:
+            # fallback: إلا hotproduct.query رجع فارغ (نادرة، أحيانًا محدودة بفئات معينة)،
+            # نجربو product.query العادي بلا ما نضيع الجولة
+            add_log("Hot products vazio — fallback para product.query normal", "warn")
+            def build_params_fallback():
+                p = build_params()
+                p["method"] = "aliexpress.affiliate.product.query"
+                p["timestamp"] = str(int(time.time() * 1000))
+                return p
+            data = _ali_api_call(build_params_fallback, timeout=30)
+            items = (data.get("aliexpress_affiliate_product_query_response",{})
+                         .get("resp_result",{}).get("result",{})
+                         .get("products",{}).get("product",[]))
         if items:
             # ترتيب إضافي يدويًا حسب lastest_volume (حجم المبيعات الأخير) —
             # ضمان إلا كان الـ sort ديال الـ API ما اتاحترمش بالكامل
@@ -306,7 +321,7 @@ def fetch_products(keyword, n=2):
                 except (ValueError, TypeError):
                     return 0
             items.sort(key=sales_volume, reverse=True)
-            add_log(f"AliExpress: {len(items)} produto(s), top vendas: {sales_volume(items[0])} un.", "ok")
+            add_log(f"AliExpress: {len(items)} produto(s) mais vendidos, top: {sales_volume(items[0])} un.", "ok")
             return items[:n]
         else:
             add_log(f"AliExpress: resposta vazia — {data}", "warn")
