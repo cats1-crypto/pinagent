@@ -136,6 +136,13 @@ logs = []
 stats = {"today": 0, "total": 0, "last_run": None}
 fired_slots = set()  # مشتركة بين scheduler() الداخلي و/api/cron-check باش ما ينشرش مرتين لنفس الوقت
 job_state = {"status": "idle", "results": None}  # idle | running | done | error
+published_today = {"date": None, "ids": set()}  # كنتفاداو بيه تكرار نفس المنتجات فـ نفس اليوم
+
+def _reset_published_if_new_day():
+    today_str = get_brt().strftime("%Y-%m-%d")
+    if published_today["date"] != today_str:
+        published_today["date"] = today_str
+        published_today["ids"] = set()
 
 def run_pipeline_async(manual=True):
     """
@@ -272,12 +279,13 @@ def mock_products(kw, n=2):
          "product_main_image_url":"https://ae01.alicdn.com/kf/HTB2.jpg"},
     ][:n]
 
-def fetch_products(keyword, n=2):
+def fetch_products(keyword, n=2, exclude_ids=None):
+    exclude_ids = exclude_ids or set()
     if not ALI_KEY or not ALI_SECRET:
         add_log("Demo mode — sem credenciais AliExpress", "warn")
         return mock_products(keyword, n)
 
-    fetch_count = max(n * 5, 20)  # كنجيبو مرشحين أكثر باش الترتيب يكون موثوق
+    fetch_count = max(n * 8, 30)  # كنجيبو مرشحين أكثر باش يبقى عندنا بدائل بعد استبعاد المنشور من قبل
 
     def call(method, extra_params):
         def build_params():
@@ -324,15 +332,19 @@ def fetch_products(keyword, n=2):
         try:
             items, data = call(method, extra)
             last_data = data
-            if items:
+            # كنشيلو المنتجات اللي ديجا تنشرو اليوم باش ما يتكررش نفس المنشور
+            fresh_items = [it for it in items if it.get("product_id") not in exclude_ids]
+            if fresh_items:
                 def sales_volume(p):
                     try:
                         return int(str(p.get("lastest_volume", 0)).replace(",", "") or 0)
                     except (ValueError, TypeError):
                         return 0
-                items.sort(key=sales_volume, reverse=True)
-                add_log(f"AliExpress: {len(items)} produto(s) via {method} ({extra}), top: {sales_volume(items[0])} un.", "ok")
-                return items[:n]
+                fresh_items.sort(key=sales_volume, reverse=True)
+                add_log(f"AliExpress: {len(fresh_items)} produto(s) novo(s) via {method} ({extra}), top: {sales_volume(fresh_items[0])} un.", "ok")
+                return fresh_items[:n]
+            elif items:
+                add_log(f"AliExpress: {len(items)} produto(s) mas todos já publicados hoje — tentando outra busca", "warn")
         except Exception as e:
             add_log(f"AliExpress erro ({method}): {e}", "warn")
 
@@ -476,7 +488,12 @@ def run_pipeline(manual=False):
     search_keyword = KEYWORDS[day_idx]      # بالإنجليزية — للبحث فـ AliExpress
     keyword = KEYWORDS_PT[day_idx]          # بالبرتغالية — للعرض/المحتوى
     add_log(f"Pipeline {'MANUAL' if manual else 'AUTO'} — '{keyword}' ({search_keyword})", "ok")
-    products = fetch_products(search_keyword, n=2)
+    _reset_published_if_new_day()
+    products = fetch_products(search_keyword, n=2, exclude_ids=published_today["ids"])
+    for p in products:
+        pid = p.get("product_id")
+        if pid:
+            published_today["ids"].add(pid)
     results = []
     for p in products:
         content = generate_content(p, keyword)
