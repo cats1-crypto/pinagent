@@ -14,15 +14,7 @@ PIN_TOKEN     = os.environ.get("PIN_TOKEN", "")
 PIN_BOARD_ID  = os.environ.get("PIN_BOARD_ID", "")
 TG_TOKEN      = os.environ.get("TG_TOKEN", "")
 TG_CHANNEL    = os.environ.get("TG_CHANNEL", "@Ofertassdiariasaliexpresss")
-BLOGGER_TOKEN   = os.environ.get("BLOGGER_TOKEN", "")
-BLOGGER_REFRESH = os.environ.get("BLOGGER_REFRESH", "")
-BLOGGER_CLIENT  = os.environ.get("BLOGGER_CLIENT_ID", "")
-BLOGGER_SECRET  = os.environ.get("BLOGGER_CLIENT_SECRET", "")
-BLOGGER_BLOG_ID = os.environ.get("BLOGGER_BLOG_ID", "2781402232561095495")
-BUFFER_TOKEN    = os.environ.get("BUFFER_TOKEN", "")
-BUFFER_PROFILES = os.environ.get("BUFFER_PROFILES", "")  # comma-separated Buffer channel IDs
 
-BUFFER_API_URL = "https://api.buffer.com"
 
 POST_CHAR_LIMIT = 250
 
@@ -57,8 +49,8 @@ def pick_trending_hashtags(budget_chars, day_offset=0, max_count=3):
 
 # إيموجي حسب فئة المنتج (كيلي "keyword" ديال اليوم)
 CATEGORY_EMOJIS = {
-    "fone": "🎧", "bluetooth": "🎧", "smartwatch": "⌚", "cabo": "🔌",
-    "case": "📱", "led": "💡", "organizador": "🗄️", "brinquedo": "🧸",
+    "earbuds": "🎧", "bluetooth": "🎧", "watch": "⌚", "cable": "🔌",
+    "case": "📱", "led": "💡", "organizer": "🗄️", "toy": "🧸",
 }
 
 def pick_emoji(keyword):
@@ -120,8 +112,18 @@ PEAK = {
     6: ["09:00","10:00","20:00","21:00"],
 }
 KEYWORDS = [
+    "wireless bluetooth earbuds",
+    "smart watch",
+    "usb type c fast charging cable",
+    "clear phone case",
+    "led strip light",
+    "kitchen drawer organizer",
+    "educational toy for kids",
+]
+# تسمية بالبرتغالية لكل كلمة، تستعمل غير للعرض/الإيموجي (البحث كيخدم بالإنجليزية)
+KEYWORDS_PT = [
     "fone bluetooth sem fio",
-    "smartwatch barato 2024",
+    "smartwatch",
     "cabo usb tipo c carga rapida",
     "case celular transparente",
     "led strip rgb quarto",
@@ -355,7 +357,6 @@ def generate_content(product, keyword):
             "pinterest_description": f"Achado incrível! {title} por R$ {sale}\n#achadinhos #aliexpress #oferta #desconto #brasil",
             "pinterest_alt_text": f"Produto AliExpress: {title}. Preço R$ {sale}",
             "telegram_text": capped,
-            "buffer_text": capped,
             "aff_url_pin": aff_pin, "aff_url_tg": aff_tg, "image_url": img, "product": product,
         }
 
@@ -364,7 +365,7 @@ Produto: {title}
 Preco: R$ {sale} (era R$ {orig}, -{disc}%)
 Avaliacao: {rate} | Keyword: {keyword}
 Link Pinterest: {aff_pin}
-JSON SOMENTE (apenas conteudo do Pinterest — telegram/buffer sao gerados por template fixo):
+JSON SOMENTE (apenas conteudo do Pinterest — telegram gerado por template fixo):
 {{"pinterest_title":"titulo Pin SEO max 95 chars keyword+beneficio+preco","pinterest_description":"descricao Pin 450 chars PT emojis beneficios urgencia CTA 8 hashtags #achadinhos #aliexpress #oferta #desconto #brasil #comprasonline #fretegratis #promocao","pinterest_alt_text":"alt text SEO descritivo max 300 chars"}}"""
 
     try:
@@ -378,7 +379,7 @@ JSON SOMENTE (apenas conteudo do Pinterest — telegram/buffer sao gerados por t
         content = json.loads(text.replace("```json","").replace("```","").strip())
         content.update({
             "aff_url_pin": aff_pin, "aff_url_tg": aff_tg, "image_url": img, "product": product,
-            "telegram_text": capped, "buffer_text": capped,
+            "telegram_text": capped,
         })
         add_log(f"Claude OK: {title[:35]}...", "ok")
         return content
@@ -389,7 +390,6 @@ JSON SOMENTE (apenas conteudo do Pinterest — telegram/buffer sao gerados por t
             "pinterest_description": f"Achado! {title} por R$ {sale}\n#achadinhos #aliexpress #oferta #brasil",
             "pinterest_alt_text": f"Produto AliExpress: {title}",
             "telegram_text": capped,
-            "buffer_text": capped,
             "aff_url_pin":aff_pin,"aff_url_tg":aff_tg,"image_url":img,"product":product,
         }
 
@@ -462,227 +462,22 @@ def publish_telegram(content):
         return {"ok":False,"ch":"telegram","error":str(e)}
 
 
-def refresh_blogger_token():
-    """Use refresh token to get new access token."""
-    global BLOGGER_TOKEN
-    if not BLOGGER_REFRESH or not BLOGGER_CLIENT or not BLOGGER_SECRET:
-        return False
-    try:
-        resp = http_post(
-            "https://oauth2.googleapis.com/token",
-            {"client_id": BLOGGER_CLIENT, "client_secret": BLOGGER_SECRET,
-             "refresh_token": BLOGGER_REFRESH, "grant_type": "refresh_token"}
-        )
-        BLOGGER_TOKEN = resp.get("access_token","")
-        add_log("Blogger token refreshed OK", "ok")
-        return bool(BLOGGER_TOKEN)
-    except Exception as e:
-        add_log(f"Blogger refresh erro: {e}", "err")
-        return False
-
-def generate_blogger_post(content, keyword):
-    """Generate full HTML blog post for Blogger."""
-    product = content.get("product", {})
-    title   = product.get("product_title","")
-    sale    = product.get("sale_price","0")
-    orig    = product.get("original_price","0")
-    rate    = product.get("evaluate_rate","95%")
-    img     = content.get("image_url","")
-    aff_url = content.get("aff_url_pin","")
-    disc    = round((1-float(sale)/float(orig))*100) if float(orig)>0 else 0
-
-    html = f"""<div style="max-width:800px;margin:0 auto;font-family:Arial,sans-serif">
-<img src="{img}" alt="{title}" style="width:100%;max-width:500px;border-radius:12px;display:block;margin:0 auto 20px">
-<h2 style="color:#e60023">{content.get("pinterest_title","")}</h2>
-<div style="background:#fff3cd;border-left:4px solid #e60023;padding:15px;margin:20px 0;border-radius:8px">
-  <p style="font-size:24px;font-weight:bold;color:#e60023;margin:0">R$ {sale}</p>
-  <p style="color:#666;margin:5px 0">De <s>R$ {orig}</s> — Economia de {disc}%</p>
-  <p style="color:#28a745;margin:5px 0">⭐ {rate} de aprovação dos compradores</p>
-</div>
-<h3>Por que comprar?</h3>
-<ul style="line-height:2">
-  <li>✅ Produto com alta avaliação dos compradores</li>
-  <li>✅ Preço com desconto de {disc}%</li>
-  <li>✅ Entrega para todo o Brasil</li>
-  <li>✅ Compra segura pelo AliExpress</li>
-</ul>
-<div style="text-align:center;margin:30px 0">
-  <a href="{aff_url}" target="_blank" rel="nofollow"
-     style="background:#e60023;color:white;padding:15px 40px;border-radius:25px;text-decoration:none;font-size:18px;font-weight:bold;display:inline-block">
-    🛒 Comprar Agora no AliExpress
-  </a>
-</div>
-<p style="color:#888;font-size:12px;text-align:center">
-  Preços e disponibilidade podem mudar. Verifique no site oficial.
-  Links de afiliado — colaboramos com o AliExpress.
-</p>
-</div>"""
-    return html
-
-def publish_blogger(content, keyword):
-    global BLOGGER_TOKEN
-    if not BLOGGER_BLOG_ID:
-        return {"ok":False,"simulated":True,"ch":"blogger"}
-    # Refresh token if needed
-    if not BLOGGER_TOKEN:
-        if not refresh_blogger_token():
-            return {"ok":False,"simulated":True,"ch":"blogger","error":"No token"}
-    try:
-        post_html = generate_blogger_post(content, keyword)
-        product = content.get("product",{})
-        labels  = ["AliExpress","Ofertas","Achadinhos","Brasil",keyword.split()[0].capitalize()]
-        resp = http_post(
-            f"https://www.googleapis.com/blogger/v3/blogs/{BLOGGER_BLOG_ID}/posts/",
-            {"kind":"blogger#post",
-             "title": content.get("pinterest_title","Oferta do Dia"),
-             "content": post_html,
-             "labels": labels},
-            {"Authorization": f"Bearer {BLOGGER_TOKEN}"}
-        )
-        post_url = resp.get("url","")
-        post_id  = resp.get("id","")
-        add_log(f"Blogger post #{post_id}", "ok")
-        return {"ok":True,"ch":"blogger","post_id":post_id,"url":post_url}
-    except Exception as e:
-        err = str(e)
-        # Token expired — refresh and retry
-        if "401" in err:
-            add_log("Blogger token expirado — renovando...", "warn")
-            if refresh_blogger_token():
-                return publish_blogger(content, keyword)
-        add_log(f"Blogger erro: {err}", "err")
-        return {"ok":False,"ch":"blogger","error":err}
-
-
-def _buffer_graphql(query, variables=None):
-    """
-    استدعاء عام لـ Buffer GraphQL API (endpoint واحد: https://api.buffer.com).
-    كتستعمل Bearer token، وكترجع الـ 'data' أو كترمي Exception إلا كاين errors.
-    """
-    body = {"query": query}
-    if variables:
-        body["variables"] = variables
-    resp = http_post(BUFFER_API_URL, body, {"Authorization": f"Bearer {BUFFER_TOKEN}"})
-    if resp.get("errors"):
-        raise Exception(resp["errors"][0].get("message", "Buffer GraphQL error"))
-    return resp.get("data", {})
-
-def _buffer_get_channel_ids():
-    """كيجيب channel IDs ديال أول organization متاحة، كيستثني القنوات المفصولة."""
-    data = _buffer_graphql("query { account { organizations { id } } }")
-    orgs = (data.get("account") or {}).get("organizations", [])
-    if not orgs:
-        return []
-    org_id = orgs[0]["id"]
-    query = """
-    query GetChannels($orgId: OrganizationId!) {
-      channels(input: {organizationId: $orgId}) {
-        id
-        service
-        isDisconnected
-      }
-    }
-    """
-    data = _buffer_graphql(query, {"orgId": org_id})
-    channels = data.get("channels", []) or []
-    return [(c["id"], c.get("service","")) for c in channels if not c.get("isDisconnected")]
-
-def publish_buffer(content, keyword):
-    """
-    ينشر مباشرة (shareNow) عبر Buffer GraphQL API الحالي (createPost mutation).
-    الـ REST القديم (api.bufferapp.com/1/...) متوقف ومكانش كيخدم.
-    BUFFER_PROFILES (اختياري): channel IDs مفصولة بفاصلة. إلا فارغة، كتجيب
-    القنوات المتصلة تلقائيًا من الـ organization الأولى.
-    """
-    if not BUFFER_TOKEN:
-        return {"ok": False, "simulated": True, "ch": "buffer"}
-    try:
-        if BUFFER_PROFILES.strip():
-            channels = [(c.strip(), "") for c in BUFFER_PROFILES.split(",") if c.strip()]
-        else:
-            channels = _buffer_get_channel_ids()
-        if not channels:
-            return {"ok": False, "ch": "buffer", "error": "No channels found"}
-
-        product = content.get("product", {})
-        title   = product.get("product_title", "")
-        sale    = product.get("sale_price", "0")
-        orig    = product.get("original_price", "0")
-        disc    = round((1-float(sale)/float(orig))*100) if float(orig)>0 else 0
-        aff_url = content.get("aff_url_pin", "")
-        img     = content.get("image_url", "")
-        rate    = product.get("evaluate_rate", "95%")
-
-        text = content.get("buffer_text") or build_capped_post(title, sale, orig, disc, aff_url, keyword, POST_CHAR_LIMIT)
-        if len(text) > POST_CHAR_LIMIT:
-            text = text[:POST_CHAR_LIMIT]
-
-        mutation = """
-        mutation CreatePost($input: CreatePostInput!) {
-          createPost(input: $input) {
-            ... on PostActionSuccess { post { id status } }
-            ... on InvalidInputError { message }
-            ... on UnauthorizedError { message }
-            ... on UnexpectedError { message }
-            ... on RestProxyError { message }
-            ... on LimitReachedError { message }
-            ... on NotFoundError { message }
-          }
-        }
-        """
-
-        results = []
-        for cid, service in channels[:3]:  # حد أقصى 3 قنوات فـ كل دفعة
-            try:
-                assets = []
-                if img:
-                    assets = [{"image": {"url": img, "metadata": {"altText": (title[:100] or "AliExpress product")}}}]
-                input_data = {
-                    "channelId": cid,
-                    "schedulingType": "automatic",
-                    "mode": "shareNow",
-                    "text": text,
-                    "assets": assets,
-                    "source": "PinAgentCloud",
-                }
-                # Facebook محتاج نوع المنشور إجباريًا (post/story/reel)
-                if service == "facebook":
-                    input_data["metadata"] = {"facebook": {"type": "post"}}
-                variables = {"input": input_data}
-                data = _buffer_graphql(mutation, variables)
-                payload = data.get("createPost", {}) or {}
-                if payload.get("post"):
-                    results.append(cid)
-                else:
-                    add_log(f"Buffer canal {cid}: {payload.get('message','erro desconhecido')}", "warn")
-            except Exception as e:
-                add_log(f"Buffer canal {cid}: {e}", "warn")
-
-        if results:
-            add_log(f"Buffer: {len(results)} canal(is) publicado(s)", "ok")
-            return {"ok": True, "ch": "buffer", "profiles": len(results)}
-        return {"ok": False, "ch": "buffer", "error": "All channels failed"}
-    except Exception as e:
-        add_log(f"Buffer erro: {e}", "err")
-        return {"ok": False, "ch": "buffer", "error": str(e)}
-
 def run_pipeline(manual=False):
     brt = get_brt()
     day_idx = (brt.weekday() + 1) % 7
-    keyword = KEYWORDS[day_idx]
-    add_log(f"Pipeline {'MANUAL' if manual else 'AUTO'} — '{keyword}'", "ok")
-    products = fetch_products(keyword, n=2)
+    search_keyword = KEYWORDS[day_idx]      # بالإنجليزية — للبحث فـ AliExpress
+    keyword = KEYWORDS_PT[day_idx]          # بالبرتغالية — للعرض/المحتوى
+    add_log(f"Pipeline {'MANUAL' if manual else 'AUTO'} — '{keyword}' ({search_keyword})", "ok")
+    products = fetch_products(search_keyword, n=2)
     results = []
     for p in products:
         content = generate_content(p, keyword)
         r_pin = publish_pinterest(content)
         r_tg  = publish_telegram(content)
-        r_blog   = publish_blogger(content, keyword)
-        r_buffer = publish_buffer(content, keyword)
         if r_pin.get("ok") or r_tg.get("ok"): stats["today"] += 1; stats["total"] += 1
         results.append({
             "product": p.get("product_title","")[:50],
-            "pinterest": r_pin, "telegram": r_tg, "blogger": r_blog, "buffer": r_buffer,
+            "pinterest": r_pin, "telegram": r_tg,
             "content": {"title": content.get("pinterest_title",""),
                         "description": content.get("pinterest_description","")[:200],
                         "image": content.get("image_url","")}
@@ -853,8 +648,6 @@ html,body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMa
           <div class="cfg-row"><span>AliExpress</span><div class="cfg-dot dot-no" id="d-ali"></div></div>
           <div class="cfg-row"><span>Pinterest</span><div class="cfg-dot dot-no" id="d-pin"></div></div>
           <div class="cfg-row"><span>Telegram</span><div class="cfg-dot dot-no" id="d-tg"></div></div>
-          <div class="cfg-row"><span>Blogger</span><div class="cfg-dot dot-no" id="d-blogger"></div></div>
-          <div class="cfg-row"><span>Buffer</span><div class="cfg-dot dot-no" id="d-buffer"></div></div>
         </div>
         <div class="card"><div class="ctitle">Próximos horários de pico</div><div id="slots-list"></div></div>
         <button id="runbtn" onclick="runNow()">📌 Publicar agora</button>
@@ -908,8 +701,6 @@ html,body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMa
           <div>PIN_BOARD_ID <span style="color:var(--yw)">← ID do seu board</span></div>
           <div>TG_TOKEN <span style="color:var(--yw)">← @BotFather</span></div>
           <div>TG_CHANNEL <span style="color:var(--tx)">= @Ofertassdiariasaliexpresss</span></div>
-          <div>BUFFER_TOKEN <span style="color:var(--yw)">← Buffer Dashboard → API</span></div>
-          <div>BUFFER_PROFILES <span style="color:var(--tx)">(opcional, channel IDs separados por vírgula)</span></div>
         </div>
       </div>
     </div>
@@ -1137,9 +928,7 @@ function renderResults(results){
       '<div class="rtitle">'+( content.title||r.product||"")+'</div>'+
       '<div class="rdesc">'+(content.description||"").slice(0,120)+'...</div>'+
       (rPin.url?'<a href="'+rPin.url+'" class="rlink" target="_blank">↗ Ver Pin no Pinterest</a>':'')+
-      (rTg.url?'<a href="'+rTg.url+'" class="rlink" target="_blank">↗ Ver no Telegram</a>':'')+
-      (r.blogger&&r.blogger.url?'<a href="'+r.blogger.url+'" class="rlink" target="_blank">↗ Ver no Blogger</a>':'')+
-      (r.buffer&&r.buffer.ok?'<span style="font-size:11px;color:#22C55E;display:block;margin-top:4px">✅ Buffer: '+( r.buffer.profiles||1)+' perfil(s)</span>':'');
+      (rTg.url?'<a href="'+rTg.url+'" class="rlink" target="_blank">↗ Ver no Telegram</a>':'');
     list.appendChild(div);
   });
   document.getElementById("res-section").style.display="block";
@@ -1203,11 +992,11 @@ def api_status():
     for d in range(7):
         idx = (day + d) % 7
         for t in PEAK.get(idx, []):
-            slots.append({"day":DAYS[idx],"time":t,"keyword":KEYWORDS[idx]})
+            slots.append({"day":DAYS[idx],"time":t,"keyword":KEYWORDS_PT[idx]})
     return jsonify({
         "brt_time": hhmm,
         "brt_day": DAYS[day],
-        "keyword_today": KEYWORDS[day],
+        "keyword_today": KEYWORDS_PT[day],
         "is_peak": hhmm in PEAK.get(day, []),
         "next_slots": slots[:8],
         "stats": stats,
@@ -1217,13 +1006,10 @@ def api_status():
             "aliexpress": bool(ALI_KEY and ALI_SECRET),
             "pinterest": bool(PIN_TOKEN and PIN_BOARD_ID),
             "telegram": bool(TG_TOKEN),
-            "blogger": bool(BLOGGER_REFRESH or BLOGGER_TOKEN),
-            "buffer": bool(BUFFER_TOKEN),
         }
     })
 
 add_log("PinAgent Cloud started", "ok")
-if BLOGGER_REFRESH: refresh_blogger_token()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
