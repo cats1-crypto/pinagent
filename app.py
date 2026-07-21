@@ -276,59 +276,67 @@ def fetch_products(keyword, n=2):
     if not ALI_KEY or not ALI_SECRET:
         add_log("Demo mode — sem credenciais AliExpress", "warn")
         return mock_products(keyword, n)
-    try:
-        fetch_count = max(n * 5, 20)  # كنجيبو مرشحين أكثر باش الترتيب يكون موثوق
+
+    fetch_count = max(n * 5, 20)  # كنجيبو مرشحين أكثر باش الترتيب يكون موثوق
+
+    def call(method, extra_params):
         def build_params():
-            return {
+            p = {
                 "app_key": ALI_KEY,
-                # hotproduct.query = endpoint مخصص للمنتجات "الأكثر مبيعًا/رائجة"
-                # (ماشي بحث عادي بالكلمة كيفما product.query)
-                "method": "aliexpress.affiliate.hotproduct.query",
+                "method": method,
                 "sign_method": "sha256",
                 "timestamp": str(int(time.time() * 1000)),
                 "format": "json",
                 "v": "2.0",
-                "keywords": keyword,  # كنخليو الكلمة كفلتر خفيف باش تتنوع الفئات على مدار الأسبوع
                 "target_currency": "BRL",
                 "target_language": "PT",
                 "tracking_id": ALI_TRACKING,
                 "page_no": "1",
                 "page_size": str(fetch_count),
-                "ship_to_country": "BR",  # الاسم الصحيح ديال الباراميتر (كان "country" غلط)
-                "sort": "LAST_VOLUME_DESC",  # الأكثر مبيعًا مؤخرًا أولاً
             }
+            p.update(extra_params)
+            return p
         data = _ali_api_call(build_params, timeout=30)
-        items = (data.get("aliexpress_affiliate_hotproduct_query_response",{})
-                     .get("resp_result",{}).get("result",{})
-                     .get("products",{}).get("product",[]))
-        if not items:
-            # fallback: إلا hotproduct.query رجع فارغ (نادرة، أحيانًا محدودة بفئات معينة)،
-            # نجربو product.query العادي بلا ما نضيع الجولة
-            add_log("Hot products vazio — fallback para product.query normal", "warn")
-            def build_params_fallback():
-                p = build_params()
-                p["method"] = "aliexpress.affiliate.product.query"
-                p["timestamp"] = str(int(time.time() * 1000))
-                return p
-            data = _ali_api_call(build_params_fallback, timeout=30)
-            items = (data.get("aliexpress_affiliate_product_query_response",{})
-                         .get("resp_result",{}).get("result",{})
-                         .get("products",{}).get("product",[]))
-        if items:
-            # ترتيب إضافي يدويًا حسب lastest_volume (حجم المبيعات الأخير) —
-            # ضمان إلا كان الـ sort ديال الـ API ما اتاحترمش بالكامل
-            def sales_volume(p):
-                try:
-                    return int(str(p.get("lastest_volume", 0)).replace(",", "") or 0)
-                except (ValueError, TypeError):
-                    return 0
-            items.sort(key=sales_volume, reverse=True)
-            add_log(f"AliExpress: {len(items)} produto(s) mais vendidos, top: {sales_volume(items[0])} un.", "ok")
-            return items[:n]
-        else:
-            add_log(f"AliExpress: resposta vazia — {data}", "warn")
-    except Exception as e:
-        add_log(f"AliExpress erro: {e}", "warn")
+        response_key = method.replace(".", "_") + "_response"
+        items = (data.get(response_key, {})
+                     .get("resp_result", {}).get("result", {})
+                     .get("products", {}).get("product", []))
+        return items, data
+
+    # محاولات متدرجة: من الأكثر تقييدًا (hot + sort + ship_to_country) للأقل
+    # تقييدًا (product.query بالكلمة بوحدها) — بعض الحسابات كترجع "result is
+    # empty" مع فلاتر زايدة حتى لو كانت الكلمة صحيحة.
+    attempts = [
+        ("aliexpress.affiliate.hotproduct.query",
+         {"keywords": keyword, "sort": "LAST_VOLUME_DESC", "ship_to_country": "BR"}),
+        ("aliexpress.affiliate.hotproduct.query",
+         {"keywords": keyword, "sort": "LAST_VOLUME_DESC"}),
+        ("aliexpress.affiliate.hotproduct.query",
+         {"keywords": keyword}),
+        ("aliexpress.affiliate.product.query",
+         {"keywords": keyword, "sort": "LAST_VOLUME_DESC", "ship_to_country": "BR"}),
+        ("aliexpress.affiliate.product.query",
+         {"keywords": keyword}),
+    ]
+
+    last_data = None
+    for method, extra in attempts:
+        try:
+            items, data = call(method, extra)
+            last_data = data
+            if items:
+                def sales_volume(p):
+                    try:
+                        return int(str(p.get("lastest_volume", 0)).replace(",", "") or 0)
+                    except (ValueError, TypeError):
+                        return 0
+                items.sort(key=sales_volume, reverse=True)
+                add_log(f"AliExpress: {len(items)} produto(s) via {method} ({extra}), top: {sales_volume(items[0])} un.", "ok")
+                return items[:n]
+        except Exception as e:
+            add_log(f"AliExpress erro ({method}): {e}", "warn")
+
+    add_log(f"AliExpress: todas as tentativas vazias — {last_data}", "warn")
     return mock_products(keyword, n)
 
 def generate_content(product, keyword):
