@@ -15,6 +15,12 @@ PIN_BOARD_ID  = os.environ.get("PIN_BOARD_ID", "")
 TG_TOKEN      = os.environ.get("TG_TOKEN", "")
 TG_CHANNEL    = os.environ.get("TG_CHANNEL", "@Ofertassdiariasaliexpresss")
 
+# مراقبة قنوات Telegram خارجية (اختياري) — كتلقط صفقات جديدة فـ الوقت الحقيقي
+TELEGRAM_API_ID   = os.environ.get("TELEGRAM_API_ID", "")
+TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
+TELETHON_SESSION  = os.environ.get("TELETHON_SESSION", "")
+SOURCE_CHANNELS   = [c for c in os.environ.get("SOURCE_CHANNELS", "").split(",") if c.strip()]
+
 
 POST_CHAR_LIMIT = 250
 
@@ -269,6 +275,43 @@ def generate_affiliate_link(product_url, promotion_link_type="2"):
     return None
 
 
+def extract_product_id(url):
+    """كتستخرج الـ product_id من رابط AliExpress خام (مستعملة من طرف الـ scraper)."""
+    import re
+    m = re.search(r"/item/(?:.*?)?(\d{6,})\.html|/(\d{9,})(?:\.html)?|item_id=(\d+)", url)
+    if not m:
+        return None
+    return next((g for g in m.groups() if g), None)
+
+
+def fetch_product_by_id(product_id):
+    """كتجيب تفاصيل منتج معين (سعر، صورة، تقييم) انطلاقًا من product_id — مستعملة من طرف الـ scraper."""
+    if not ALI_KEY or not ALI_SECRET:
+        return None
+    try:
+        def build_params():
+            return {
+                "app_key": ALI_KEY,
+                "method": "aliexpress.affiliate.productdetail.get",
+                "sign_method": "sha256",
+                "timestamp": str(int(time.time() * 1000)),
+                "format": "json",
+                "v": "2.0",
+                "product_ids": product_id,
+                "tracking_id": ALI_TRACKING,
+                "target_currency": "BRL",
+                "target_language": "PT",
+            }
+        data = _ali_api_call(build_params, timeout=20)
+        items = (data.get("aliexpress_affiliate_productdetail_get_response", {})
+                     .get("resp_result", {}).get("result", {})
+                     .get("products", {}).get("product", []))
+        return items[0] if items else None
+    except Exception as e:
+        add_log(f"AliExpress productdetail erro: {e}", "warn")
+        return None
+
+
 def mock_products(kw, n=2):
     return [
         {"product_id":"1005001","product_title":f"Fone Bluetooth 5.3 TWS {kw}",
@@ -482,6 +525,20 @@ def publish_telegram(content):
         return {"ok":False,"ch":"telegram","error":str(e)}
 
 
+def _publish_one_product(p, keyword):
+    """كتبني المحتوى وتنشر منتج واحد (Pinterest + Telegram) — مستعملة من run_pipeline وأيضًا من الـ scraper."""
+    content = generate_content(p, keyword)
+    r_pin = publish_pinterest(content)
+    r_tg  = publish_telegram(content)
+    if r_pin.get("ok") or r_tg.get("ok"): stats["today"] += 1; stats["total"] += 1
+    return {
+        "product": p.get("product_title","")[:50],
+        "pinterest": r_pin, "telegram": r_tg,
+        "content": {"title": content.get("pinterest_title",""),
+                    "description": content.get("pinterest_description","")[:200],
+                    "image": content.get("image_url","")}
+    }
+
 def run_pipeline(manual=False):
     brt = get_brt()
     day_idx = (brt.weekday() + 1) % 7
@@ -494,22 +551,53 @@ def run_pipeline(manual=False):
         pid = p.get("product_id")
         if pid:
             published_today["ids"].add(pid)
-    results = []
-    for p in products:
-        content = generate_content(p, keyword)
-        r_pin = publish_pinterest(content)
-        r_tg  = publish_telegram(content)
-        if r_pin.get("ok") or r_tg.get("ok"): stats["today"] += 1; stats["total"] += 1
-        results.append({
-            "product": p.get("product_title","")[:50],
-            "pinterest": r_pin, "telegram": r_tg,
-            "content": {"title": content.get("pinterest_title",""),
-                        "description": content.get("pinterest_description","")[:200],
-                        "image": content.get("image_url","")}
-        })
+    results = [_publish_one_product(p, keyword) for p in products]
     stats["last_run"] = brt.strftime("%H:%M BRT")
     add_log(f"Concluido — {len(results)} produto(s)", "ok")
     return results
+
+
+# ── مراقبة قنوات Telegram خارجية (اختياري) — صفقات فـ الوقت الحقيقي ────────
+def _process_scraped_deal(product_url):
+    """
+    كتخدم فـ Thread منفصل (باش ما توقفش event loop ديال Telethon). كتاخد
+    رابط AliExpress خام من رسالة مراقبة، كتبني المنشور، وتنشره فورًا —
+    بلا ما تنتظر وقت الذروة (الصفقات حساسة للوقت).
+    """
+    try:
+        _reset_published_if_new_day()
+        pid = extract_product_id(product_url)
+        if not pid or pid in published_today["ids"]:
+            return
+        detail = fetch_product_by_id(pid)
+        if not detail:
+            add_log(f"Scraper: não foi possível obter detalhes do produto {pid}", "warn")
+            return
+        published_today["ids"].add(pid)
+        add_log(f"Scraper: deal detectado — {detail.get('product_title','')[:40]}...", "ok")
+        _publish_one_product(detail, detail.get("product_title", ""))
+    except Exception as e:
+        add_log(f"Scraper: erro processando {product_url} — {e}", "err")
+
+def _on_deal_found(product_url):
+    threading.Thread(target=_process_scraped_deal, args=(product_url,), daemon=True).start()
+
+scraper_service = None
+if TELEGRAM_API_ID and TELEGRAM_API_HASH and TELETHON_SESSION and SOURCE_CHANNELS:
+    try:
+        from telegram_scraper import TelegramScraperService
+        scraper_service = TelegramScraperService(
+            api_id=int(TELEGRAM_API_ID),
+            api_hash=TELEGRAM_API_HASH,
+            session_string=TELETHON_SESSION,
+            source_channels=SOURCE_CHANNELS,
+            on_deal_found=_on_deal_found,
+            log_fn=add_log,
+        )
+        scraper_service.start()
+    except Exception as e:
+        add_log(f"Scraper: falha ao iniciar — {e}", "err")
+
 
 def scheduler():
     while True:
@@ -673,6 +761,7 @@ html,body{background:var(--bg);color:var(--tx);font-family:-apple-system,BlinkMa
           <div class="cfg-row"><span>AliExpress</span><div class="cfg-dot dot-no" id="d-ali"></div></div>
           <div class="cfg-row"><span>Pinterest</span><div class="cfg-dot dot-no" id="d-pin"></div></div>
           <div class="cfg-row"><span>Telegram</span><div class="cfg-dot dot-no" id="d-tg"></div></div>
+          <div class="cfg-row"><span>Scraper (canais externos)</span><div class="cfg-dot dot-no" id="d-scraper"></div></div>
         </div>
         <div class="card"><div class="ctitle">Próximos horários de pico</div><div id="slots-list"></div></div>
         <button id="runbtn" onclick="runNow()">📌 Publicar agora</button>
@@ -856,8 +945,8 @@ function pollStatus(){
     }
     // Update config dots
     if(data.config){
-      ["anthropic","aliexpress","pinterest","telegram"].forEach(function(k){
-        var dot=document.getElementById("d-"+k.replace("aliexpress","ali").replace("pinterest","pin").replace("telegram","tg").replace("anthropic","anthropic"));
+      ["anthropic","aliexpress","pinterest","telegram","scraper"].forEach(function(k){
+        var dot=document.getElementById("d-"+k.replace("aliexpress","ali").replace("pinterest","pin").replace("telegram","tg").replace("anthropic","anthropic").replace("scraper","scraper"));
         if(dot){dot.className="cfg-dot "+(data.config[k]?"dot-ok":"dot-no");}
       });
     }
@@ -1031,6 +1120,7 @@ def api_status():
             "aliexpress": bool(ALI_KEY and ALI_SECRET),
             "pinterest": bool(PIN_TOKEN and PIN_BOARD_ID),
             "telegram": bool(TG_TOKEN),
+            "scraper": bool(scraper_service and scraper_service.is_configured),
         }
     })
 
