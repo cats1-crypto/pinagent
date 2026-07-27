@@ -85,11 +85,28 @@ class TelegramScraperService:
 
         @self._client.on(events.NewMessage(chats=self.source_channels))
         async def handler(event):
+            self.log(f"Scraper: nova mensagem recebida em {getattr(event.chat, 'username', '') or event.chat_id}", "info")
             text = event.raw_text or ""
             match = PRODUCT_LINK_RE.search(text)
-            if not match:
+            product_url = None
+            if match:
+                product_url = match.group(1)
+            else:
+                # بزاف قنوات الصفقات كتحط الرابط فـ زر (inline button) بدل النص
+                try:
+                    if event.message.buttons:
+                        for row in event.message.buttons:
+                            for btn in row:
+                                url = getattr(btn, "url", None)
+                                if url and "aliexpress." in url.lower():
+                                    product_url = url
+                                    break
+                            if product_url:
+                                break
+                except Exception:
+                    pass
+            if not product_url:
                 return
-            product_url = match.group(1)
             try:
                 self.on_deal_found(product_url)
             except Exception as e:
