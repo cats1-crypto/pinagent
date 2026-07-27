@@ -565,9 +565,14 @@ def _process_scraped_deal(product_url):
     بلا ما تنتظر وقت الذروة (الصفقات حساسة للوقت).
     """
     try:
+        add_log(f"Scraper: link detectado — {product_url}", "info")
         _reset_published_if_new_day()
         pid = extract_product_id(product_url)
-        if not pid or pid in published_today["ids"]:
+        if not pid:
+            add_log(f"Scraper: não foi possível extrair product_id de {product_url}", "warn")
+            return
+        if pid in published_today["ids"]:
+            add_log(f"Scraper: produto {pid} já publicado hoje — ignorado", "info")
             return
         detail = fetch_product_by_id(pid)
         if not detail:
@@ -580,6 +585,7 @@ def _process_scraped_deal(product_url):
         add_log(f"Scraper: erro processando {product_url} — {e}", "err")
 
 def _on_deal_found(product_url):
+    add_log(f"Scraper: mensagem nova com link AliExpress — processando...", "info")
     threading.Thread(target=_process_scraped_deal, args=(product_url,), daemon=True).start()
 
 scraper_service = None
